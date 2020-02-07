@@ -117,7 +117,7 @@ for SQLFile in $(find "./${BUCKET}/" -name \*-schema.sql | sort); do
   fi
   CurrentTable=
 
-  mysql $BUCKET -BNe "SHOW TABLE STATUS LIKE '${Table}'" > /dev/null 2>&1
+  mysql $BUCKET -BNe "SHOW CREATE TABLE ${Table}" > /dev/null 2>&1
   if [ "$?" -ne 0 ]; then
     _echo "Table ${Table} does not exists, creating"
     mysql $BUCKET -BN < $SQLFile
