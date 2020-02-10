@@ -60,6 +60,8 @@ function check_replica_lag() {
   if [ "$_SecondsBehindMaster" -ge $_MaxLag ]; then
     _echo "Replication behind $_SecondsBehindMaster seconds"
     return 1
+  else
+    _echo "Replication lag on $_ReplicaHost is $_SecondsBehindMaster seconds"
   fi
 
   return 0
@@ -130,7 +132,8 @@ for SQLFile in $(find "./${BUCKET}/" -name \*-schema.sql | sort); do
 
   _echo "Starting table import for $Table"
 
-  for ChunkFile in $(eval "find ./$BUCKET/ -name $BUCKET.$Table.\*.sql" | sort -n); do
+  PreviousTs=$(date +%s)
+  for ChunkFile in $(eval "find ./$BUCKET/ -name $BUCKET.$Table.\*.sql -o -name $BUCKET.$Table.sql" | sort -n); do
     CurrentChunk=$(basename $ChunkFile)
     if [ "x$Chunk" != "x" -a "x$Chunk" != "x$CurrentChunk" ]; then
       # _echo "Skipping $CurrentChunk"
@@ -140,17 +143,23 @@ for SQLFile in $(find "./${BUCKET}/" -name \*-schema.sql | sort); do
     Chunk=
     _echo "Importing $ChunkFile"
     # Make sure we ignore duplicate key errors
-    sed -i 's/INSERT INTO/INSERT IGNORE INTO/g' $ChunkFile
+    # 0.9.5 mydumper now supports --insert-ignore
+    #sed -i 's/INSERT INTO/INSERT IGNORE INTO/g' $ChunkFile
     mysql $BUCKET -BN < $ChunkFile
     if [ "$?" -ne 0 ]; then
       _d_inf "Chunk import failed for $ChunkFile"
     fi
     
     # For simplicity, we check only one replica for now
-    check_replica_lag $REPLICA $MAX_LAG
-    while [ "$?" -ne 0 ]; do
-      sleep 2
-    done
+    CurrentTs=$(date +%s)
+    if [ "$(($CurrentTs-$PreviousTs))" -ge 5 ]; then
+      PreviousTs=$(date +%s)
+
+      check_replica_lag $REPLICA $MAX_LAG
+      while [ "$?" -ne 0 ]; do
+        sleep 2
+      done
+    fi
   done
 done
 
