@@ -27,6 +27,43 @@ VERSION = 0.1
 SIGTERM_CAUGHT = False
 logger = None
 
+sql_schemigrator_checksums = ("""
+CREATE TABLE IF NOT EXISTS schemigrator_checksums (
+   db             CHAR(64)     NOT NULL,
+   tbl            CHAR(64)     NOT NULL,
+   chunk          INT          NOT NULL,
+   chunk_time     FLOAT            NULL,
+   chunk_index    VARCHAR(200)     NULL,
+   lower_boundary TEXT             NULL,
+   upper_boundary TEXT             NULL,
+   this_crc       CHAR(40)     NOT NULL,
+   this_cnt       INT          NOT NULL,
+   master_crc     CHAR(40)         NULL,
+   master_cnt     INT              NULL,
+   ts             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+   PRIMARY KEY (db, tbl, chunk),
+   INDEX ts_db_tbl (ts, db, tbl)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""")
+
+sql_schemigrator_binlog_status = ("""
+CREATE TABLE IF NOT EXISTS schemigrator_binlog_status (
+    fil VARCHAR(255) NOT NULL, 
+    pos BIGINT UNSIGNED NOT NULL, 
+    PRIMARY KEY (fil, pos)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""")
+
+sql_schemigrator_checkpoint = ("""
+CREATE TABLE IF NOT EXISTS schemigrator_checkpoint (
+    tbl VARCHAR(255) NOT NULL, 
+    minpk BIGINT UNSIGNED NOT NULL DEFAULT 0, 
+    maxpk BIGINT UNSIGNED NOT NULL DEFAULT 0, 
+    lastpk BIGINT UNSIGNED NOT NULL DEFAULT 0, 
+    status TINYINT NOT NULL DEFAULT 0, 
+    PRIMARY KEY (tbl)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""")
 
 def sm_sigterm_handler(signal, frame):
     global SIGTERM_CAUGHT
@@ -98,7 +135,7 @@ def sm_buildopts():
 
 def sm_create_logger(debug, name):
     logger = logging.getLogger(name)
-    logformat = '%(asctime)s <%(process)d> %(levelname)s {0} :: %(message)s'.format(name.ljust(24))
+    logformat = '%(asctime)s <%(process)d> %(levelname)s_[{0}]_:: %(message)s'.format(name.ljust(24))
 
     if debug:
         loglevel = logging.DEBUG
@@ -192,20 +229,69 @@ class Schemigrate(object):
         self.mysql_dst.query('USE %s' % self.opts.src_dsn['db'])
 
     def setup_metadata_tables(self, tables):
-        sql = ("CREATE TABLE IF NOT EXISTS schemigrator_binlog_status ("
-               "fil VARCHAR(255) NOT NULL, pos INT UNSIGNED NOT NULL, "
-               "PRIMARY KEY (fil, pos)) ENGINE=InnoDB")
-        self.mysql_dst.query(sql)
-
-        sql = ("CREATE TABLE IF NOT EXISTS schemigrator_checkpoint ("
-               "tbl VARCHAR(255) NOT NULL, minpk INT UNSIGNED NOT NULL DEFAULT 0, "
-               "maxpk INT UNSIGNED NOT NULL DEFAULT 0, lastpk INT UNSIGNED NOT NULL DEFAULT 0, "
-               "status TINYINT NOT NULL DEFAULT 0, PRIMARY KEY (tbl)) ENGINE=InnoDB")
-        self.mysql_dst.query(sql)
+        self.mysql_dst.query(sql_schemigrator_binlog_status)
+        self.mysql_dst.query(sql_schemigrator_checksums)
+        self.mysql_dst.query(sql_schemigrator_checkpoint)
 
         for table in tables:
-            sql = "INSERT IGNORE INTO schemigrator_checkpoint (tbl) VALUES('%s')" % table['tbl']
+            sql = "INSERT IGNORE INTO schemigrator_checkpoint (tbl) VALUES('%s')" % table
             self.mysql_dst.query(sql)
+
+    def create_dst_tables(self, tables):
+        """ Copy tables from source to dest, do not create if table already exists
+        """
+        tables_in_dst = self.list_bucket_tables(from_source=False)
+        for table in tables:
+            if table not in tables_in_dst:
+                self.logger.info("Creating table '%s' on target" % table)
+                create_sql = self.mysql_src.fetchone('SHOW CREATE TABLE %s' % table)
+                self.mysql_dst.query(create_sql['Create Table'].strip())
+
+    def list_bucket_tables(self, from_source=True):
+        sql = ('SELECT TABLE_NAME AS tbl FROM INFORMATION_SCHEMA.TABLES '
+               'WHERE ENGINE="InnoDB" AND TABLE_TYPE="BASE TABLE" AND '
+               'TABLE_SCHEMA="%s"' % self.opts.bucket)
+
+        if from_source:
+            rows = self.mysql_src.query(sql)
+        else:
+            rows = self.mysql_dst.query(sql)
+
+        if len(rows) == 0:
+            if from_source:
+                self.logger.error('Source bucket has no tables!')
+            return False
+
+        tables = []
+        for row in rows:
+            tables.append(row['tbl'])
+
+        return tables
+
+    def get_binlog_checkpoint(self):
+        sql = 'SELECT * FROM schemigrator_binlog_status'
+        fil_pos = self.mysql_dst.query(sql)
+
+        binlog_fil = None
+        binlog_pos = None
+
+        if len(fil_pos) > 1:
+            raise Exception('Multiple binlog coordinates reported on schemigrator_binlog_status')
+        elif len(fil_pos) == 1:
+            binlog_fil = fil_pos['fil']
+            binlog_pos = fil_pos['pos']
+
+        return binlog_fil, binlog_pos
+
+    def get_binlog_coords(self):
+        binlog_fil, binlog_pos = self.get_binlog_checkpoint()
+
+        if binlog_fil is None:
+            binlog_fil, binlog_pos = self.master_status()
+            self.logger.info('Binlog replication info is empty, SHOW MASTER STATUS')
+            self.logger.info('Starting file: %s, position: %d' % (binlog_fil, binlog_pos))
+
+        return binlog_fil, binlog_pos
 
     def master_status(self):
         status = self.mysql_src.fetchone('SHOW MASTER STATUS')
@@ -213,12 +299,14 @@ class Schemigrate(object):
 
     def run_table_copier(self, table):
         copier = TableCopier(self.opts.src_dsn, self.opts.dst_dsn, self.opts.bucket, table, 
-                             debug=self.opts.debug, pause_file=self.opts.pause_file, stop_file=self.opts.stop_file)
+                             debug=self.opts.debug, pause_file=self.opts.pause_file, stop_file=self.opts.stop_file,
+                             chunk_size=self.opts.chunk_size)
         copier.run()
 
     def run_replication_client(self, binlog_fil, binlog_pos):
         repl = ReplicationClient(self.opts.src_dsn, self.opts.dst_dsn, self.opts.bucket, binlog_fil, binlog_pos, 
-                                 debug=self.opts.debug, pause_file=self.opts.pause_file, stop_file=self.opts.stop_file)
+                                 debug=self.opts.debug, pause_file=self.opts.pause_file, stop_file=self.opts.stop_file,
+                                 chunk_size=self.opts.chunk_size)
         repl.run()
 
     def run(self):
@@ -229,27 +317,14 @@ class Schemigrate(object):
         self.logger.debug(str(self.opts.dst_dsn))
 
         self.setup_bootstrap()
-        sql = ('SELECT TABLE_NAME AS tbl FROM INFORMATION_SCHEMA.TABLES '
-               'WHERE ENGINE="InnoDB" AND TABLE_TYPE="BASE TABLE" AND TABLE_SCHEMA="%s"' % self.opts.src_dsn['db'])
-        tables = self.mysql_src.query(sql)
-        if len(tables) == 0:
+        tables = self.list_bucket_tables()
+        if not tables:
             self.logger.error('Source bucket has no tables!')
             return 0
 
         self.setup_metadata_tables(tables)
-
-        sql = 'SELECT * FROM schemigrator_binlog_status'
-        fil_pos = self.mysql_dst.query(sql)
-        if len(fil_pos) > 1:
-            self.logger.error('Multiple binlog coordinates reported on schemigrator_binlog_status')
-            return 0
-        elif len(fil_pos) == 0:
-            binlog_fil, binlog_pos = self.master_status()
-            self.logger.info('Binlog replication info is empty, SHOW MASTER STATUS')
-            self.logger.info('Starting file: %s, position: %d' % (binlog_fil, binlog_pos))
-        else:
-            binlog_fil = fil_pos['fil']
-            binlog_pos = fil_pos['pos']
+        self.create_dst_tables(tables)
+        binlog_fil, binlog_pos = self.get_binlog_coords()
 
         self.replication_client = Process(target=self.run_replication_client, 
                                           args=(binlog_fil, binlog_pos,), name='replication_client')
@@ -260,7 +335,7 @@ class Schemigrate(object):
         #repl.run()
 
         for table in tables:
-            self.table_copier = Process(target=self.run_table_copier, args=(table['tbl'],), name='table_copier')
+            self.table_copier = Process(target=self.run_table_copier, args=(table,), name='table_copier')
             self.table_copier.start()
 
             while self.is_alive and self.table_copier.is_alive():
@@ -283,7 +358,7 @@ class Schemigrate(object):
 
 
 class TableCopier(object):
-    def __init__(self, src_dsn, dst_dsn, bucket, table, debug=False, pause_file=None, stop_file=None):
+    def __init__(self, src_dsn, dst_dsn, bucket, table, debug=False, pause_file=None, stop_file=None, chunk_size=1000):
         # Grab SHOW CREATE TABLE from source
         # Identify if there is PK/UK
         # Get MIN/MAX PK/UK, record to checkpoint table
@@ -296,6 +371,7 @@ class TableCopier(object):
         self.maxpk = None
         self.pause_file = pause_file
         self.stop_file = stop_file
+        self.chunk_size = chunk_size
         # These variables will only hold chunks that has been successfully 
         # copied
         self.current_minpk = 0
@@ -351,6 +427,7 @@ class TableCopier(object):
         sql = ('SELECT COALESCE(MIN({0}), 0) AS minpk, COALESCE(MAX({0}), 0) AS maxpk '
                'FROM {1}').format(self.pk, self.table)
         pkrange = self.mysql_src.fetchone(sql)
+        self.logger.debug('PK range for %s based on source %s' % (self.table, str(pkrange)))
         
         return pkrange['minpk'], pkrange['maxpk']
 
@@ -379,8 +456,11 @@ class TableCopier(object):
         self.pk = self.get_table_primary_key()
 
         checkpoint = self.get_checkpoint()
-        if checkpoint is None:
+        if checkpoint is None or self.status == 0:
             self.minpk, self.maxpk = self.get_min_max_range()
+        else:
+            self.minpk = checkpoint['minpk']
+            self.maxpk = checkpoint['maxpk']
 
         if self.maxpk == 0:
             self.logger.info('Table %s has no rows' % self.table)
@@ -412,7 +492,7 @@ class TableCopier(object):
 
 class ReplicationClient(object):
     def __init__(self, src_dsn, dst_dsn, bucket, binlog_fil=None, binlog_pos=None, 
-                 debug=False, pause_file=None, stop_file=None):
+                 debug=False, pause_file=None, stop_file=None, chunk_size=1000):
         # Sync to checkpoint every chunk completion
         self.bucket = bucket
         self.src_dsn = src_dsn
@@ -425,7 +505,13 @@ class ReplicationClient(object):
         self.is_alive = True
         self.pause_file = pause_file
         self.stop_file = stop_file
+        self.chunk_size = chunk_size
         self.pkcols = {}
+        self.trx_size = 0
+        self.trx_open = False
+        self.trx_open_ts = None
+        self.mysql_dst = MySQLConnection(self.dst_dsn, 'ReplicationClient, applier, dst')
+        self.metrics = {}
 
     def signal_handler(self, signal, frame):
         self.logger.info("Signal caught (%s), cleaning up" % str(signal))
@@ -438,6 +524,39 @@ class ReplicationClient(object):
                 return "%3.1f%s%s" % (num, unit, suffix)
             num /= 1024.0
         return "%.1f%s%s" % (num, 'Yi', suffix)
+
+    def log_event_metrics(self, start=False, binlog_fil=None, binlog_pos=None):
+        if start:
+            self.metrics['timer'] = time.time()
+            self.metrics['events'] = 0
+            self.metrics['rows'] = 0
+            self.metrics['bytes'] = 0
+            self.metrics['binlog_pos_last'] = 0
+            return True
+
+        now = time.time()
+        self.metrics['events'] += 1
+
+        if self.metrics['binlog_pos_last'] == 0:
+            self.metrics['binlog_pos_last'] = binlog_pos
+        elif self.metrics['binlog_pos_last'] > binlog_pos:
+            self.metrics['bytes'] += (self.metrics['bytes'] + binlog_pos)
+        else:
+            self.metrics['bytes'] += (binlog_pos - self.metrics['binlog_pos_last'])
+
+        self.metrics['binlog_pos_last'] = binlog_pos
+
+        if (now - self.metrics['timer']) >= 10:
+            self.logger.info('File: %s, position: %s, events read: %d, rows applied: %d, size: %s, time: %.2f secs' % (
+                binlog_fil, binlog_pos, self.metrics['events'], self.metrics['rows'],
+                self.sizeof_fmt(self.metrics['bytes']), (now - self.metrics['timer'])))
+            self.metrics['timer'] = now
+            self.metrics['rows'] = 0
+            self.metrics['events'] = 0
+            self.metrics['bytes'] = 0
+            self.metrics['binlog_pos_last'] = 0
+
+        return True
 
     def get_table_primary_key(self, table):
         mysql_src = MySQLConnection(self.src_dsn, 'ReplicationClient, %s, src' % table)
@@ -462,27 +581,59 @@ class ReplicationClient(object):
         # otherwise just start replication from recent file/pos
         pass
 
-    def checksum_chunk(self, where):
+    def checksum_chunk(self, values):
         """ Calculate checksum based on row event from binlog stream """
         pass
 
-    def update(self, table, values):
+    def begin_apply_trx(self):
+        self.mysql_dst.query('BEGIN')
+        # We track the time the trx is opened, we do not want to keep a transation open
+        # for a very long time even if the number of row events is less than chunk-size
+        self.trx_open_ts = time.time()
+        self.trx_open = True
+
+    def commit_apply_trx(self):
+        commit_time = 0.0
+        commit_time_start = 0.0
+        commit_time_size = 0
+
+        self.checkpoint_write()
+        commit_time_start = time.time()
+        self.mysql_dst.query('COMMIT')
+        commit_time = time.time() - commit_time_start
+        commit_time_size = self.trx_size
+        self.logger.info('COMMIT size: %d, time: %.2f' % (commit_time_size, commit_time))
+        commit_time_size = 0
+        commit_time = 0.0
+        self.trx_size = 0
+        self.trx_open = False
+
+    def update(self, cursor, table, values):
         if table not in self.pkcols:
             self.pkcols[table] = self.get_table_primary_key(table)
 
         self.logger.info('REPLACE INTO %s WHERE %s = %d' % (table, self.pkcols[table], values[self.pkcols[table]]))
+        self.trx_size += 1
 
-    def insert(self, table, values):
+    def insert(self, cursor, table, values):
         if table not in self.pkcols:
             self.pkcols[table] = self.get_table_primary_key(table)
 
-        self.logger.info('INSERT INTO %s WHERE %s = %d' % (table, self.pkcols[table], values[self.pkcols[table]]))
+        sql = 'INSERT INTO %s (%s) VALUES (%s)' % (table, ', '.join(values.keys()), 
+                                                   ', '.join(['%s'] * len(values)))
+        self.logger.debug(sql)
+        self.logger.debug(str(values.values()))
+        cursor.execute(sql, values.values())
+        self.trx_size += 1
 
-    def delete(self, table, values):
+    def delete(self, cursor, table, values):
         if table not in self.pkcols:
             self.pkcols[table] = self.get_table_primary_key(table)
 
-        self.logger.info('DELETE FROM %s WHERE %s = %d' % (table, self.pkcols[table], values[self.pkcols[table]]))
+        sql = 'DELETE FROM {0} WHERE {1} = %s'.format(table, self.pkcols[table])
+        self.logger.info(sql)
+        cursor.execute(sql, (values[self.pkcols[table]], ))
+        self.trx_size += 1
 
     def run(self):
         """ Start binlog replication process 
@@ -503,17 +654,23 @@ class ReplicationClient(object):
             only_events=[DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent], 
             blocking=True)
         #, only_schemas=[self.bucket]
+        cursor = None
 
         self.logger.info('Replication client started')
-        status_timer = time.time()
-        status_now = status_timer
-        status_counter_events = 0
-        status_counter_rows = 0
-        status_counter_bytes = 0
-        status_bytes_now = 0
+        self.log_event_metrics(start=True)
 
         for binlogevent in stream:
             self.logger.debug('__binlogevent_loop')
+            self.binlog_pos = int(stream.log_pos)
+            self.binlog_fil = stream.log_file
+
+            """ We put the commit apply here as we need to capture the NEXT
+            binlog event file and position into the checkpoint table instead
+            of the previous one as long as the COMMIT here succeeds
+            """
+            if self.trx_open and (self.trx_size >= self.chunk_size or (time.time() - self.trx_open_ts) >= 5):
+                self.commit_apply_trx()
+                cursor.close()
 
             if not self.is_alive:
                 self.logger.info('Terminating binlog event processing')
@@ -537,16 +694,30 @@ class ReplicationClient(object):
             absolutely zero traffic.
             """
             if binlogevent.schema == self.bucket:
+                if not self.trx_open:
+                    cursor = self.mysql_dst.conn.cursor()
+                    self.begin_apply_trx()
+
+                """ For close of open transaction so we can run the checksum safely
+                """
+                if self.trx_open and self.trx_size > 0 and binlogevent.table == 'schemigrator_checksums':
+                    self.commit_apply_trx()
+                    cursor.close()
+                    cursor = self.mysql_dst.conn.cursor()
+                    self.begin_apply_trx()
+
                 for row in binlogevent.rows:
                     try:
-                        if isinstance(binlogevent, DeleteRowsEvent):
-                            self.insert(binlogevent.table, row["values"])
+                        if binlogevent.table == 'schemigrator_checksums':
+                            self.checksum_chunk(row["values"])
+                        elif isinstance(binlogevent, DeleteRowsEvent):
+                            self.delete(cursor, binlogevent.table, row["values"])
                         elif isinstance(binlogevent, UpdateRowsEvent):
-                            self.insert(binlogevent.table, row["after_values"])
+                            self.update(cursor, binlogevent.table, row["after_values"])
                         elif isinstance(binlogevent, WriteRowsEvent):
-                            self.insert(binlogevent.table, row["values"])
+                            self.insert(cursor, binlogevent.table, row["values"])
 
-                        status_counter_rows += 1
+                        self.metrics['rows'] += 1
                     except AttributeError as e:
                         self.logger.error(str(e))
                         event = (binlogevent.schema, binlogevent.table, stream.log_file, int(stream.log_pos))
@@ -556,24 +727,7 @@ class ReplicationClient(object):
                     
                     sys.stdout.flush()
 
-            status_now = time.time()
-            status_counter_events += 1
-
-            if status_bytes_now > stream.log_pos:
-                status_counter_bytes += status_bytes_now + stream.log_pos
-            else:
-                status_counter_bytes += (stream.log_pos - status_bytes_now)
-
-            status_bytes_now = stream.log_pos
-
-            if (status_now - status_timer) >= 10:
-                self.logger.info('File: %s, position: %s, events read: %d, rows applied: %d, size: %s, time: %.2f secs' % (
-                    stream.log_file, stream.log_pos, status_counter_events, status_counter_rows,
-                    self.sizeof_fmt(status_counter_bytes), (status_now - status_timer)))
-                status_timer = status_now
-                status_counter_rows = 0
-                status_counter_events = 0
-                status_counter_bytes = 0
+            self.log_event_metrics(binlog_fil=stream.log_file, binlog_pos=stream.log_pos)
 
         stream.close()
 
