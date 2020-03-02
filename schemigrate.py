@@ -48,9 +48,10 @@ CREATE TABLE IF NOT EXISTS schemigrator_checksums (
 
 sql_schemigrator_binlog_status = ("""
 CREATE TABLE IF NOT EXISTS schemigrator_binlog_status (
+    bucket VARCHAR(255) NOT NULL, 
     fil VARCHAR(255) NOT NULL, 
     pos BIGINT UNSIGNED NOT NULL, 
-    PRIMARY KEY (fil, pos)
+    PRIMARY KEY (bucket)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """)
 
@@ -572,9 +573,22 @@ class ReplicationClient(object):
         mysql_src.close()
         return pk_columns[0]['col']
 
-    def checkpoint_write(self):
-        # Write last executed file and position
-        pass
+    def checkpoint_write(self, cursor, checkpoint=None):
+        """ Write last executed file and position
+        Replication checkpoints should be within the same trx as the applied
+        events so that in case of rollback, the checkpoint is also consistent
+        """
+        checkpoint = {
+            'bucket': self.bucket,
+            'fil': self.binlog_fil,
+            'pos': self.binlog_pos
+        }
+        sql = 'REPLACE INTO schemigrator_binlog_status (%s) VALUES (%s)' % (table, ', '.join(checkpoint.keys()), 
+                                                                            ', '.join(['%s'] * len(checkpoint)))
+        self.logger.debug(sql)
+        self.logger.debug(str(checkpoint.values()))
+        cursor.execute(sql, checkpoint.values())
+        self.trx_size += 1
 
     def checkpoint_read(self):
         # Read last checkpoint to resume from
@@ -597,7 +611,6 @@ class ReplicationClient(object):
         commit_time_start = 0.0
         commit_time_size = 0
 
-        self.checkpoint_write()
         commit_time_start = time.time()
         self.mysql_dst.query('COMMIT')
         commit_time = time.time() - commit_time_start
@@ -616,9 +629,6 @@ class ReplicationClient(object):
         self.trx_size += 1
 
     def insert(self, cursor, table, values):
-        if table not in self.pkcols:
-            self.pkcols[table] = self.get_table_primary_key(table)
-
         sql = 'INSERT INTO %s (%s) VALUES (%s)' % (table, ', '.join(values.keys()), 
                                                    ', '.join(['%s'] * len(values)))
         self.logger.debug(sql)
@@ -697,6 +707,7 @@ class ReplicationClient(object):
                 if not self.trx_open:
                     cursor = self.mysql_dst.conn.cursor()
                     self.begin_apply_trx()
+                    self.checkpoint_write(cursor)
 
                 """ For close of open transaction so we can run the checksum safely
                 """
@@ -705,6 +716,7 @@ class ReplicationClient(object):
                     cursor.close()
                     cursor = self.mysql_dst.conn.cursor()
                     self.begin_apply_trx()
+                    self.checkpoint_write(cursor)
 
                 for row in binlogevent.rows:
                     try:
