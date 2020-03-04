@@ -270,17 +270,17 @@ class Schemigrate(object):
         return tables
 
     def get_binlog_checkpoint(self):
-        sql = 'SELECT * FROM schemigrator_binlog_status'
+        sql = 'SELECT fil, pos FROM schemigrator_binlog_status WHERE bucket = "%s"' % self.opts.bucket
         fil_pos = self.mysql_dst.query(sql)
 
         binlog_fil = None
         binlog_pos = None
-
+        
         if len(fil_pos) > 1:
             raise Exception('Multiple binlog coordinates reported on schemigrator_binlog_status')
         elif len(fil_pos) == 1:
-            binlog_fil = fil_pos['fil']
-            binlog_pos = fil_pos['pos']
+            binlog_fil = fil_pos[0]['fil']
+            binlog_pos = fil_pos[0]['pos']
 
         return binlog_fil, binlog_pos
 
@@ -290,6 +290,9 @@ class Schemigrate(object):
         if binlog_fil is None:
             binlog_fil, binlog_pos = self.master_status()
             self.logger.info('Binlog replication info is empty, SHOW MASTER STATUS')
+            self.logger.info('Starting file: %s, position: %d' % (binlog_fil, binlog_pos))
+        else:
+            self.logger.info('Binlog replication found from checkpoint, resuming')
             self.logger.info('Starting file: %s, position: %d' % (binlog_fil, binlog_pos))
 
         return binlog_fil, binlog_pos
@@ -583,7 +586,7 @@ class ReplicationClient(object):
             'fil': self.binlog_fil,
             'pos': self.binlog_pos
         }
-        sql = 'REPLACE INTO schemigrator_binlog_status (%s) VALUES (%s)' % (table, ', '.join(checkpoint.keys()), 
+        sql = 'REPLACE INTO schemigrator_binlog_status (%s) VALUES (%s)' % (', '.join(checkpoint.keys()), 
                                                                             ', '.join(['%s'] * len(checkpoint)))
         self.logger.debug(sql)
         self.logger.debug(str(checkpoint.values()))
@@ -625,7 +628,13 @@ class ReplicationClient(object):
         if table not in self.pkcols:
             self.pkcols[table] = self.get_table_primary_key(table)
 
-        self.logger.info('REPLACE INTO %s WHERE %s = %d' % (table, self.pkcols[table], values[self.pkcols[table]]))
+        set_pairs = '{0} = %s'.format(' = %s, '.join(values.keys()))
+
+        sql = 'UPDATE %s SET %s WHERE %s = %d' % (table, set_pairs, self.pkcols[table], 
+                                                  values[self.pkcols[table]])
+        self.logger.debug(sql)
+        self.logger.debug(str(values.values()))
+        cursor.execute(sql, values.values())
         self.trx_size += 1
 
     def insert(self, cursor, table, values):
@@ -641,7 +650,7 @@ class ReplicationClient(object):
             self.pkcols[table] = self.get_table_primary_key(table)
 
         sql = 'DELETE FROM {0} WHERE {1} = %s'.format(table, self.pkcols[table])
-        self.logger.info(sql)
+        self.logger.debug(sql)
         cursor.execute(sql, (values[self.pkcols[table]], ))
         self.trx_size += 1
 
