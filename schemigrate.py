@@ -192,6 +192,31 @@ def sm_copy_dsn(src, dest):
 
     return dest
 
+""" Taken from OnlineSchemaChange """
+def escape(literal):
+    """
+    Escape the backtick in table/column name
+
+    @param literal:  name string to escape
+    @type  literal:  string
+
+    @return:  escaped string
+    @rtype :  string
+    """
+    return literal.replace('`', '``')
+
+
+def list_to_col_str(column_list):
+    """Basic helper function for turn a list of column names into a single
+    string separated by comma, and escaping the column name in the meanwhile
+
+    @param column_list:  list of column names
+    @type  column_list:  list
+
+    @return:  String of concated/escaped column names
+    @rtype :  string
+    """
+    return ', '.join('`{}`'.format(escape(col)) for col in column_list)
 
 class Schemigrate(object):
     def __init__(self, opts, logger):
@@ -315,7 +340,8 @@ class Schemigrate(object):
     def run_table_copier(self, table):
         copier = TableCopier(self.opts.src_dsn, self.opts.dst_dsn, self.opts.bucket, table, 
                              debug=self.opts.debug, pause_file=self.opts.pause_file, stop_file=self.opts.stop_file,
-                             chunk_size=self.opts.chunk_size)
+                             chunk_size=self.opts.chunk_size, replica_dsns=self.opts.replicas, 
+                             max_lag=self.opts.max_lag)
         copier.run()
 
     def run_replication_client(self, binlog_fil, binlog_pos):
@@ -374,7 +400,8 @@ class Schemigrate(object):
 
 
 class TableCopier(object):
-    def __init__(self, src_dsn, dst_dsn, bucket, table, debug=False, pause_file=None, stop_file=None, chunk_size=1000):
+    def __init__(self, src_dsn, dst_dsn, bucket, table, debug=False, pause_file=None, stop_file=None, 
+                 chunk_size=1000, replica_dsns=[], max_lag=0):
         # Grab SHOW CREATE TABLE from source
         # Identify if there is PK/UK
         # Get MIN/MAX PK/UK, record to checkpoint table
@@ -401,6 +428,10 @@ class TableCopier(object):
         self.mysql_src = None
         self.mysql_dst = None
         self.logger.info('My PID is %d' % os.getpid())
+        self.mysql_replicas = {}
+        self.replica_dsns = replica_dsns
+        self.max_lag = max_lag
+        self.connect_replicas()
 
     def signal_handler(self, signal, frame):
         self.logger.info("Signal caught (%s), cleaning up" % str(signal))
@@ -426,6 +457,32 @@ class TableCopier(object):
             self.log_event_metrics(start=True, rows=0, frompk=self.metrics['topk']+1, topk=self.metrics['topk']+1)
 
         return True
+
+    def connect_replicas(self):
+        self.logger.debug(self.replica_dsns)
+        if len(self.replica_dsns) == 0:
+            return True
+        
+        for dsn in self.replica_dsns:
+            self.mysql_replicas['%s:%d' % (dsn['host'], dsn['port'])] = MySQLConnection(dsn, 'TableCopier, replmonitor, dst')
+            self.logger.info('Connected to target replica %s:%d' % (dsn['host'], dsn['port']))
+
+        return True
+
+    def max_replica_lag(self, max_lag=60):
+        max_sbm = None
+        sbm = 0
+        replica = None
+
+        for replica in self.mysql_replicas.keys():
+            sbm = self.mysql_replicas[replica].seconds_behind_master()
+            """ We can short circuit here given max_lag value but we don't to keep the connection
+            open, otherwise we have to implement a keepalive somewhere
+            """
+            if sbm is not None and (max_sbm is None or sbm > max_sbm):
+                max_sbm = sbm
+
+        return max_sbm, replica
 
     def get_checkpoint(self):
         """ Read from dest server current checkpoint position for the table """
@@ -467,7 +524,7 @@ class TableCopier(object):
         for column in columns:
             colarr.append(column['col'])
 
-        return ', '.join(colarr)
+        return list_to_col_str(colarr)
 
     def get_min_max_range(self):
         """ Identify min max PK values we should only operate from """
@@ -492,7 +549,7 @@ class TableCopier(object):
         try:
             cursor.execute('BEGIN')
             cursor.executemany(sql, rows)
-            self.set_checkpoint(cursor, topk, status=1)
+            self.set_checkpoint(cursor, topk+1, status=1)
             cursor.execute('COMMIT')
             self.status = 1
         except MySQLdb._exceptions.OperationalError as err:
@@ -578,9 +635,11 @@ class TableCopier(object):
             return 1
         
         cursor = self.mysql_dst.conn.cursor()
-        sbm_check_time = time.time()
+        max_replica_lag_secs = None
+        max_replica_lag_host = None
+        max_replica_lag_time = time.time()
 
-        self.log_event_metrics(start=True, rows=0, frompk=0, topk=0)
+        self.log_event_metrics(start=True, rows=0, frompk=self.lastpk, topk=0)
         while self.lastpk < self.maxpk and self.is_alive:
             self.logger.debug('__chunk_loop')
 
@@ -602,12 +661,25 @@ class TableCopier(object):
             self.log_event_metrics(rows=rows_copied, frompk=self.lastpk, topk=nextpk, commit_time=commit_time)
             #time.sleep(1)
             self.lastpk = nextpk + 1
-            if (time.time() - sbm_check_time) >= 5.0:
-                sbm_check_time = time.time()
 
-            continue
+            while True and self.max_lag > 0 and self.is_alive and (time.time() - max_replica_lag_time) > 5:
+                max_replica_lag_secs, max_replica_lag_host = self.max_replica_lag(max_lag=self.max_lag)
 
-        self.logger.info('Copying %s complete!' % self.table)
+                if max_replica_lag_secs is None:
+                    self.logger.error('None of the replicas has Seconds_Behind_Master')
+                    time.sleep(5)
+                elif max_replica_lag_secs > self.max_lag:
+                    self.logger.error('Replica lag is %d on %s, paused' % (max_replica_lag_secs, max_replica_lag_host))
+                    time.sleep(5)
+                else:
+                    max_replica_lag_time = time.time()
+                    break
+
+        if self.lastpk >= self.maxpk:
+            self.logger.info('Copying %s complete!' % self.table)
+        else:
+            self.logger.info('Stopping copy at next PK value %d' % self.lastpk)
+            
         return 0
 
 
@@ -747,10 +819,9 @@ class ReplicationClient(object):
         }
         self.checkpoint_committed_binlog_fil = self.checkpoint_next_binlog_fil
         self.checkpoint_committed_binlog_pos = self.checkpoint_next_binlog_pos
+        
         sql = 'REPLACE INTO schemigrator_binlog_status (%s) VALUES (%s)' % (', '.join(checkpoint.keys()), 
                                                                             ', '.join(['%s'] * len(checkpoint)))
-        self.logger.debug(sql)
-        self.logger.debug(str(checkpoint.values()))
         cursor.execute(sql, checkpoint.values())
         self.trx_size += 1
 
@@ -820,10 +891,18 @@ class ReplicationClient(object):
         cursor.execute(self.mysql_dst.sqlize(sql), (values[self.pkcols[table]], ))
         self.trx_size += 1
 
-    def start_slave(self):
+    def start_slave(self, binlog_fil=None, binlog_pos=None):
+        this_binlog_fil = self.binlog_fil
+        this_binlog_pos = self.binlog_pos
+        if binlog_fil is not None:
+            this_binlog_fil = binlog_fil
+            this_binlog_pos = binlog_pos
+
+
+        self.logger.info('Starting replication at %s:%d' % (this_binlog_fil, this_binlog_pos))
         stream = BinLogStreamReader(
             connection_settings=self.src_dsn, resume_stream=True,
-            server_id=172313514, log_file=self.binlog_fil, log_pos=self.binlog_pos,
+            server_id=172313514, log_file=this_binlog_fil, log_pos=this_binlog_pos,
             only_events=[DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent, XidEvent], 
             blocking=True)
         #, only_schemas=[self.bucket]
@@ -873,6 +952,13 @@ class ReplicationClient(object):
             if os.path.exists(self.stop_file):
                 self.logger.info('Stopped via %s file' % self.stop_file)
                 break
+            
+            """ We keep this outside of the bucket check, to make sure that even when there are
+            no events for the bucket we checkpoint binlog pos regularly.
+            """
+            if not self.trx_open:
+                cursor = self.mysql_dst.conn.cursor()
+                self.begin_apply_trx()
 
             """ When there are no matching event from the stream because of only_schemas
             this loop blocks at SIGTERM/SIGKILL with `with binlogevent from stream`
@@ -883,9 +969,6 @@ class ReplicationClient(object):
             absolutely zero traffic.
             """
             if binlogevent.schema == self.bucket:
-                if not self.trx_open:
-                    cursor = self.mysql_dst.conn.cursor()
-                    self.begin_apply_trx()
 
                 """ For close of open transaction so we can run the checksum safely
                 """
@@ -956,7 +1039,7 @@ class ReplicationClient(object):
 
         while True:
             try:
-                retcode = self.start_slave()
+                retcode = self.start_slave(self.checkpoint_committed_binlog_fil, self.checkpoint_committed_binlog_pos)
             except MySQLdb._exceptions.OperationalError as err:
                 if 'Deadlock found when trying to get lock' in str(err) or 'Lock wait timeout exceeded' in str(err):
                     if self.trx_open:
