@@ -12,11 +12,10 @@ from multiprocessing import Process, Lock, Manager
 from optparse import OptionParser
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.row_event import (
-    DeleteRowsEvent,
-    UpdateRowsEvent,
-    WriteRowsEvent,
+    DeleteRowsEvent, UpdateRowsEvent,
+    WriteRowsEvent
 )
-
+from pymysqlreplication.event import XidEvent
 
 """
 sudo apt install libmysqlclient-dev python3 python3-pip
@@ -623,8 +622,10 @@ class ReplicationClient(object):
         self.dst_dsn['db'] = self.bucket
         self.binlog_fil = binlog_fil
         self.binlog_pos = binlog_pos
-        self.checkpoint_binlog_fil = None
-        self.checkpoint_binlog_pos = None
+        self.checkpoint_next_binlog_fil = None
+        self.checkpoint_next_binlog_pos = None
+        self.checkpoint_committed_binlog_fil = None
+        self.checkpoint_committed_binlog_pos = None
         self.debug = debug
         self.logger = sm_create_logger(debug, 'ReplicationClient')
         self.is_alive = True
@@ -741,11 +742,11 @@ class ReplicationClient(object):
         """
         checkpoint = {
             'bucket': self.bucket,
-            'fil': self.binlog_fil,
-            'pos': self.binlog_pos
+            'fil': self.checkpoint_next_binlog_fil,
+            'pos': self.checkpoint_next_binlog_pos
         }
-        self.checkpoint_binlog_fil = self.binlog_fil
-        self.checkpoint_binlog_pos = self.binlog_pos
+        self.checkpoint_committed_binlog_fil = self.checkpoint_next_binlog_fil
+        self.checkpoint_committed_binlog_pos = self.checkpoint_next_binlog_pos
         sql = 'REPLACE INTO schemigrator_binlog_status (%s) VALUES (%s)' % (', '.join(checkpoint.keys()), 
                                                                             ', '.join(['%s'] * len(checkpoint)))
         self.logger.debug(sql)
@@ -764,7 +765,6 @@ class ReplicationClient(object):
 
     def begin_apply_trx(self):
         self.mysql_dst.query('BEGIN')
-        self.logger.info('BEGIN_apply_trx')
         # We track the time the trx is opened, we do not want to keep a transation open
         # for a very long time even if the number of row events is less than chunk-size
         self.trx_open_ts = time.time()
@@ -777,7 +777,6 @@ class ReplicationClient(object):
 
         commit_time_start = time.time()
         self.mysql_dst.query('COMMIT')
-        self.logger.info('COMMIT_apply_trx %s:%d' % (self.binlog_fil, self.binlog_pos))
         commit_time = time.time() - commit_time_start
         commit_time_size = self.trx_size
         self.metrics['commit_size'] += self.trx_size
@@ -787,11 +786,12 @@ class ReplicationClient(object):
 
     def rollback_apply_trx(self):
         self.mysql_dst.query('ROLLBACK')
-        self.logger.info('ROLLBACK_apply_trx')
         self.trx_size = 0
         self.trx_open = False
 
     def update(self, cursor, table, values):
+        """ TODO: This is not optimal, we should cache all PK columns
+        """
         if table not in self.pkcols:
             self.pkcols[table] = self.get_table_primary_key(table)
 
@@ -799,18 +799,14 @@ class ReplicationClient(object):
 
         sql = 'UPDATE %s SET %s WHERE %s = %d' % (table, set_pairs, self.pkcols[table], 
                                                   values[self.pkcols[table]])
-        self.logger.info('UPDATE %d' % values[self.pkcols[table]])
-        #self.logger.debug(sql)
-        #self.logger.debug(str(values.values()))
+        
         cursor.execute(self.mysql_dst.sqlize(sql), values.values())
         self.trx_size += 1
 
     def insert(self, cursor, table, values):
         sql = 'REPLACE INTO %s (%s) VALUES (%s)' % (table, ', '.join(values.keys()), 
                                                    ', '.join(['%s'] * len(values)))
-        #self.logger.debug(sql)
-        #self.logger.debug(str(values.values()))
-        self.logger.info('INSERT %d' % values[self.pkcols[table]])
+
         cursor.execute(self.mysql_dst.sqlize(sql), values.values())
         self.trx_size += 1
 
@@ -819,7 +815,7 @@ class ReplicationClient(object):
             self.pkcols[table] = self.get_table_primary_key(table)
 
         sql = 'DELETE FROM {0} WHERE {1} = %s'.format(table, self.pkcols[table])
-        self.logger.info('DELETE %d' % values[self.pkcols[table]])
+        #self.logger.info('DELETE %d' % values[self.pkcols[table]])
         #self.logger.debug(sql)
         cursor.execute(self.mysql_dst.sqlize(sql), (values[self.pkcols[table]], ))
         self.trx_size += 1
@@ -828,13 +824,16 @@ class ReplicationClient(object):
         stream = BinLogStreamReader(
             connection_settings=self.src_dsn, resume_stream=True,
             server_id=172313514, log_file=self.binlog_fil, log_pos=self.binlog_pos,
-            only_events=[DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent], 
+            only_events=[DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent, XidEvent], 
             blocking=True)
         #, only_schemas=[self.bucket]
         cursor = None
         max_replica_lag_secs = None
         max_replica_lag_host = None
         max_replica_lag_time = time.time()
+        # Marks if a binlog event went to a commit, this helps us roll over properly
+        # a new GTID event if in case we want to resume replication manually
+        xid_event = False
 
         self.logger.info('Replication client started')
         self.log_event_metrics(start=True)
@@ -843,12 +842,21 @@ class ReplicationClient(object):
             #self.logger.debug('__binlogevent_loop')
             self.binlog_pos = int(stream.log_pos)
             self.binlog_fil = stream.log_file
+            
+            if isinstance(binlogevent, XidEvent):
+                xid_event = True
+                # At this point, the binlog pos has advanced to the next one, which is kind of weird
+                # so we grab the checkpoint positions here immediately after and next GTID event
+                # we probably can also use end_log_pos to avoid using continue clause below
+                self.checkpoint_next_binlog_fil = self.binlog_fil
+                self.checkpoint_next_binlog_pos = self.binlog_pos
+                continue
 
             """ We put the commit apply here as we need to capture the NEXT
             binlog event file and position into the checkpoint table instead
             of the previous one as long as the COMMIT here succeeds
             """
-            if self.trx_open and (self.trx_size >= self.chunk_size or (time.time() - self.trx_open_ts) >= 5):
+            if self.trx_open and xid_event and (self.trx_size >= self.chunk_size or (time.time() - self.trx_open_ts) >= 5):
                 self.checkpoint_write(cursor)
                 self.commit_apply_trx()
                 cursor.close()
@@ -900,6 +908,7 @@ class ReplicationClient(object):
                             self.insert(cursor, binlogevent.table, row["values"])
 
                         self.metrics['rows'] += 1
+                        xid_event = False
                     except AttributeError as e:
                         self.logger.error(str(e))
                         event = (binlogevent.schema, binlogevent.table, stream.log_file, int(stream.log_pos))
@@ -928,7 +937,8 @@ class ReplicationClient(object):
                     break
 
         stream.close()
-        self.logger.info('Replication client stopped on %s:%d' % (self.checkpoint_binlog_fil, self.checkpoint_binlog_pos))
+        self.logger.info('Replication client stopped on %s:%d' % (self.checkpoint_committed_binlog_fil, 
+                                                                  self.checkpoint_committed_binlog_pos))
         return 0
 
     def run(self):
