@@ -546,27 +546,35 @@ class TableCopier(object):
         self.conn.commit()
 
     def execute_chunk_trx(self, cursor, sql, rows, topk):
+        ts = None
+        commit_ts = None
         try:
             cursor.execute('BEGIN')
+            ts = time.time()
             cursor.executemany(sql, rows)
+            self.logger.info('Execute many %.3f' % (time.time() - ts))
             self.set_checkpoint(cursor, topk+1, status=1)
+            ts = time.time()
             cursor.execute('COMMIT')
+            commit_ts = time.time() - ts
             self.status = 1
         except MySQLdb._exceptions.OperationalError as err:
             if 'Deadlock found when trying to get lock' in str(err):
-                return 1213
+                return 1213, commit_ts
             elif 'Lock wait timeout exceeded' in str(err):
-                return 1205
+                return 1205, commit_ts
             else: 
-                return 1
+                return 1, commit_ts
 
-        return 0
+        return 0, commit_ts
 
     def copy_chunk(self, cursor, frompk, topk):
         """ Copy chunk specified by range """
+        ts = time.time()
         sql = ('SELECT /* SQL_NO_CACHE */ %s FROM %s '
                'WHERE %s BETWEEN %d AND %d') % (self.columns, self.table, self.pk, frompk, topk)
         rows = self.mysql_src.query_array(sql)
+        self.logger.info('Rows fetch %.3f' % (time.time() - ts))
         if not self.mysql_src.rowcount:
             return None
 
@@ -576,13 +584,12 @@ class TableCopier(object):
         #self.logger.debug(sql)
         #self.logger.debug(rows)
 
-        ts = time.time()
         retries = 0
         while True:
             if not self.is_alive:
                 return False, False
 
-            code = self.execute_chunk_trx(cursor, sql, rows, topk)
+            code, commit_time = self.execute_chunk_trx(cursor, sql, rows, topk)
             if code > 0:
                 if code == 1: 
                     return False, False
@@ -596,8 +603,8 @@ class TableCopier(object):
                 continue
 
             break
-
-        return (time.time() - ts), self.mysql_src.rowcount
+        
+        return commit_time, self.mysql_src.rowcount
 
     def run(self):
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -679,7 +686,7 @@ class TableCopier(object):
             self.logger.info('Copying %s complete!' % self.table)
         else:
             self.logger.info('Stopping copy at next PK value %d' % self.lastpk)
-            
+
         return 0
 
 
