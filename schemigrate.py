@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import logging
+import mysql.connector
 import os
 import signal
 import sys
@@ -9,6 +10,7 @@ import traceback
 import warnings
 import MySQLdb
 from multiprocessing import Process, Lock, Manager
+from mysql.connector import errorcode
 from optparse import OptionParser
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.row_event import (
@@ -549,10 +551,14 @@ class TableCopier(object):
         ts = None
         commit_ts = None
         try:
+            """
+            execute/executemany is slow - for 10k rows, cProfile timing below
+               ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+                10000    0.102    0.000   20.048    0.002 cursor.py:515(execute)
+                    1    0.027    0.027   20.084   20.084 cursor.py:631(executemany)
+            """
             cursor.execute('BEGIN')
-            ts = time.time()
             cursor.executemany(sql, rows)
-            self.logger.info('Execute many %.3f' % (time.time() - ts))
             self.set_checkpoint(cursor, topk+1, status=1)
             ts = time.time()
             cursor.execute('COMMIT')
@@ -570,11 +576,10 @@ class TableCopier(object):
 
     def copy_chunk(self, cursor, frompk, topk):
         """ Copy chunk specified by range """
-        ts = time.time()
         sql = ('SELECT /* SQL_NO_CACHE */ %s FROM %s '
                'WHERE %s BETWEEN %d AND %d') % (self.columns, self.table, self.pk, frompk, topk)
         rows = self.mysql_src.query_array(sql)
-        self.logger.info('Rows fetch %.3f' % (time.time() - ts))
+        
         if not self.mysql_src.rowcount:
             return None
 
@@ -641,7 +646,7 @@ class TableCopier(object):
             self.logger.info('Table has previous unrecoverable error, skipping')
             return 1
         
-        cursor = self.mysql_dst.conn.cursor()
+        cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
         max_replica_lag_secs = None
         max_replica_lag_host = None
         max_replica_lag_time = time.time()
@@ -819,17 +824,12 @@ class ReplicationClient(object):
         Replication checkpoints should be within the same trx as the applied
         events so that in case of rollback, the checkpoint is also consistent
         """
-        checkpoint = {
-            'bucket': self.bucket,
-            'fil': self.checkpoint_next_binlog_fil,
-            'pos': self.checkpoint_next_binlog_pos
-        }
+        checkpoint = (self.bucket, self.checkpoint_next_binlog_fil, self.checkpoint_next_binlog_pos)
         self.checkpoint_committed_binlog_fil = self.checkpoint_next_binlog_fil
         self.checkpoint_committed_binlog_pos = self.checkpoint_next_binlog_pos
         
-        sql = 'REPLACE INTO schemigrator_binlog_status (%s) VALUES (%s)' % (', '.join(checkpoint.keys()), 
-                                                                            ', '.join(['%s'] * len(checkpoint)))
-        cursor.execute(sql, checkpoint.values())
+        sql = 'REPLACE INTO schemigrator_binlog_status (bucket, fil, pos) VALUES (%s, %s, %s)'
+        cursor.execute(sql, checkpoint)
         self.trx_size += 1
 
     def checkpoint_read(self):
@@ -964,7 +964,7 @@ class ReplicationClient(object):
             no events for the bucket we checkpoint binlog pos regularly.
             """
             if not self.trx_open:
-                cursor = self.mysql_dst.conn.cursor()
+                cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
                 self.begin_apply_trx()
 
             """ When there are no matching event from the stream because of only_schemas
@@ -983,7 +983,7 @@ class ReplicationClient(object):
                     self.checkpoint_write(cursor)
                     self.commit_apply_trx()
                     cursor.close()
-                    cursor = self.mysql_dst.conn.cursor()
+                    cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
                     self.begin_apply_trx()
 
                 for row in binlogevent.rows:
@@ -1062,7 +1062,7 @@ class ReplicationClient(object):
 
 class MySQLConnection(object):
     def __init__(self, params, header):
-        self.conn = MySQLdb.connect(**params, autocommit=True)
+        self.conn = mysql.connector.connect(**params, autocommit=True, use_pure=True)
         self.query_header = header
         self.rowcount = None
 
@@ -1080,18 +1080,28 @@ class MySQLConnection(object):
         return self.conn.affected_rows
 
     def query(self, sql, args=None):
-        cursor = self.conn.cursor(MySQLdb.cursors.DictCursor)
+        results = None
+        cursor = mysql.connector.cursor.MySQLCursorDict(self.conn)
         cursor.execute(self.sqlize(sql), args)
         self.rowcount = cursor.rowcount
-        results = cursor.fetchall()
+        
+        if cursor.with_rows:
+            results = cursor.fetchall()
+
         cursor.close()
         return results
 
     def query_array(self, sql, args=None):
-        cursor = self.conn.cursor(MySQLdb.cursors.Cursor)
+        results = None
+        cursor = mysql.connector.cursor.MySQLCursor(self.conn)
         cursor.execute(self.sqlize(sql), args)
         self.rowcount = cursor.rowcount
-        return cursor.fetchall()
+
+        if cursor.with_rows:
+            results = cursor.fetchall()
+        
+        cursor.close()
+        return results
 
     def fetchone(self, sql, column=None):
         results = self.query(sql)
@@ -1108,7 +1118,7 @@ class MySQLConnection(object):
         with warnings.catch_warnings():
             warnings.filterwarnings('error', category=MySQLdb.Warning)
             try:
-                cursor = self.conn.cursor()
+                cursor = mysql.connector.cursor.MySQLCursorDict(self.conn)
                 cursor.execute(self.sqlize(sql), args)
             except Warning as db_warning:
                 logger.warning(
