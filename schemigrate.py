@@ -8,7 +8,6 @@ import sys
 import time
 import traceback
 import warnings
-import MySQLdb
 from multiprocessing import Process, Lock, Manager
 from mysql.connector import errorcode
 from optparse import OptionParser
@@ -207,7 +206,6 @@ def escape(literal):
     """
     return literal.replace('`', '``')
 
-
 def list_to_col_str(column_list):
     """Basic helper function for turn a list of column names into a single
     string separated by comma, and escaping the column name in the meanwhile
@@ -219,6 +217,7 @@ def list_to_col_str(column_list):
     @rtype :  string
     """
     return ', '.join('`{}`'.format(escape(col)) for col in column_list)
+
 
 class Schemigrate(object):
     def __init__(self, opts, logger):
@@ -391,19 +390,24 @@ class Schemigrate(object):
 
         while self.replication_client.is_alive():
             if not self.is_alive:
-                self.logger.info('Main thread is is ready to shutdown, but replication is still running (checkpointing?), waiting')
+                self.logger.info('Waiting for ReplicationClient')
                 # We can keep sending kill signal, but would be redundant, ReplicationClient.is_alive
                 # should be already set
                 # self.replication_client.terminate()
-            time.sleep(1)
+            time.sleep(3)
+
+        while self.table_copier.is_alive():
+            if not self.is_alive:
+                self.logger.info('Waiting for TableCopier')
+            time.sleep(3)
 
         self.logger.info("Done")
         return 0
 
 
 class TableCopier(object):
-    def __init__(self, src_dsn, dst_dsn, bucket, table, debug=False, pause_file=None, stop_file=None, 
-                 chunk_size=1000, replica_dsns=[], max_lag=0):
+    def __init__(self, src_dsn, dst_dsn, bucket, table, debug=False, pause_file=None, 
+                 stop_file=None, chunk_size=1000, replica_dsns=[], max_lag=0, use_inout_file=True):
         # Grab SHOW CREATE TABLE from source
         # Identify if there is PK/UK
         # Get MIN/MAX PK/UK, record to checkpoint table
@@ -411,7 +415,8 @@ class TableCopier(object):
         self.table = table
         self.logger = sm_create_logger(debug, 'TableCopier (%s)' % self.table)
         self.pk = None
-        self.columns = None
+        self.columns_str = None
+        self.columns_arr = None
         self.colcount = 0
         self.status = 0
         self.minpk = None
@@ -434,16 +439,24 @@ class TableCopier(object):
         self.replica_dsns = replica_dsns
         self.max_lag = max_lag
         self.connect_replicas()
+        self.use_inout_file = use_inout_file
+        self.inout_file_tsv = '/tmp/schemigrator-table-copier-chunk.tsv'
+        
+        self.copy_chunk_func = self.copy_chunk_inout_file
+        if not self.use_inout_file:
+            self.copy_chunk_func = self.copy_chunk_select
 
     def signal_handler(self, signal, frame):
         self.logger.info("Signal caught (%s), cleaning up" % str(signal))
         self.is_alive = False
 
-    def log_event_metrics(self, start=False, rows=0, frompk=None, topk=None, commit_time=0.0):
+    def log_event_metrics(self, start=False, rows=0, frompk=None, topk=None, 
+                          commit_time=0.0, chunk_time=0.0):
         if start:
             self.metrics['timer'] = time.time()
             self.metrics['rows'] = 0
             self.metrics['commit_time'] = 0.0
+            self.metrics['chunk_time'] = 0.0
             self.metrics['frompk'] = frompk
             self.metrics['topk'] = topk
             return True
@@ -452,10 +465,13 @@ class TableCopier(object):
         self.metrics['topk'] = topk
         self.metrics['rows'] += rows
         self.metrics['commit_time'] += commit_time
+        self.metrics['chunk_time'] += chunk_time
 
         if (now - self.metrics['timer']) >= 10:
-            self.logger.info('Copy from: %d, to: %d, rows copied: %d, commit time: %.3f secs' % (
-                self.metrics['frompk'], self.metrics['topk'], self.metrics['rows'], self.metrics['commit_time']))
+            self.logger.info(('Copy from: %d, to: %d, rows copied: %d, chunk_time: %.3f secs, '
+                              'commit time: %.3f secs') % (self.metrics['frompk'], self.metrics['topk'], 
+                                                           self.metrics['rows'], self.metrics['chunk_time'], 
+                                                           self.metrics['commit_time']))
             self.log_event_metrics(start=True, rows=0, frompk=self.metrics['topk']+1, topk=self.metrics['topk']+1)
 
         return True
@@ -511,7 +527,9 @@ class TableCopier(object):
         elif len(pk_columns) > 1:
             raise Exception('Table %s has multiple PRIMARY KEY columns' % self.table)
 
-        return pk_columns[0]['col']
+        self.pk = pk_columns[0]['col']
+
+        return True
 
     def get_table_columns(self):
         sql = ('SELECT column_name AS col FROM information_schema.columns '
@@ -526,7 +544,10 @@ class TableCopier(object):
         for column in columns:
             colarr.append(column['col'])
 
-        return list_to_col_str(colarr)
+        self.columns_str = list_to_col_str(colarr)
+        self.columns_arr = colarr
+
+        return True
 
     def get_min_max_range(self):
         """ Identify min max PK values we should only operate from """
@@ -547,9 +568,10 @@ class TableCopier(object):
         # Calculate checksum
         self.conn.commit()
 
-    def execute_chunk_trx(self, cursor, sql, rows, topk):
+    def execute_chunk_trx_select(self, cursor, sql, rows, topk):
         ts = None
         commit_ts = None
+
         try:
             """
             execute/executemany is slow - for 10k rows, cProfile timing below
@@ -564,27 +586,44 @@ class TableCopier(object):
             cursor.execute('COMMIT')
             commit_ts = time.time() - ts
             self.status = 1
-        except MySQLdb._exceptions.OperationalError as err:
-            if 'Deadlock found when trying to get lock' in str(err):
-                return 1213, commit_ts
-            elif 'Lock wait timeout exceeded' in str(err):
-                return 1205, commit_ts
+        except mysql.connector.Error as err:
+            if err.errno in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
+                return err.errno, commit_ts
             else: 
                 return 1, commit_ts
 
         return 0, commit_ts
 
-    def copy_chunk(self, cursor, frompk, topk):
-        """ Copy chunk specified by range """
+    def execute_chunk_trx_infile(self, cursor, sql):
+        commit_ts = None
+
+        try:
+            commit_ts = time.time()
+            cursor.execute(sql)
+            commit_ts = time.time() - commit_ts
+            self.status = 1
+        except mysql.connector.Error as err:
+            if err.errno in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
+                return err.errno, commit_ts
+            else: 
+                return 1, commit_ts
+
+        return 0, commit_ts
+
+    def copy_chunk_select(self, cursor, frompk, topk):
+        """ Copy chunk specified by range using cursor.executemany """
         sql = ('SELECT /* SQL_NO_CACHE */ %s FROM %s '
-               'WHERE %s BETWEEN %d AND %d') % (self.columns, self.table, self.pk, frompk, topk)
+               'WHERE %s BETWEEN %d AND %d') % (self.columns_str, self.table, self.pk, frompk, topk)
         rows = self.mysql_src.query_array(sql)
-        
+        rows_count = 0
+
         if not self.mysql_src.rowcount:
             return None
 
+        rows_count = self.mysql_src.rowcount
+
         vals = ', '.join(['%s'] * self.colcount)
-        sql = 'INSERT IGNORE INTO %s (%s) VALUES (%s)' % (self.table, self.columns, vals)
+        sql = 'INSERT IGNORE INTO %s (%s) VALUES (%s)' % (self.table, self.columns_str, vals)
 
         #self.logger.debug(sql)
         #self.logger.debug(rows)
@@ -594,7 +633,7 @@ class TableCopier(object):
             if not self.is_alive:
                 return False, False
 
-            code, commit_time = self.execute_chunk_trx(cursor, sql, rows, topk)
+            code, commit_time = self.execute_chunk_trx_select(cursor, sql, rows, topk)
             if code > 0:
                 if code == 1: 
                     return False, False
@@ -609,7 +648,62 @@ class TableCopier(object):
 
             break
         
-        return commit_time, self.mysql_src.rowcount
+        return commit_time, rows_count
+
+    def copy_chunk_inout_file(self, cursor, frompk, topk):
+        """ Copy chunk specified by range using LOAD DATA INFILE """
+        sql = ('SELECT /* SQL_NO_CACHE */ CONCAT(%s) AS s FROM %s '
+               'WHERE %s BETWEEN %d AND %d') % (',"\\t\\t",'.join('`{}`'.format(escape(col)) for col in self.columns_arr), 
+                                                self.table, self.pk, frompk, topk)
+        print(sql)
+        rows = self.mysql_src.query_array(sql)
+        rows_count = 0
+
+        if not self.mysql_src.rowcount:
+            return None
+
+        rows_count = self.mysql_src.rowcount
+
+        if not self.mysql_src.rowcount:
+            return None
+
+        rows_count = self.mysql_src.rowcount
+        print(self.mysql_src.rowcount)
+        print(rows)
+        sys.exit(0)
+        with open(self.inout_file_tsv, 'w') as chunkfd:
+            for row in rows:
+                chunkfd.write(row[0])
+
+        chunkfd.close()
+
+        vals = ', '.join(['%s'] * self.colcount)
+        sql = ('LOAD DATA INFILE "%s" IGNORE INTO TABLE %s '
+               'FIELDS TERMINATED BY "\t\t" (%s)') % (self.inout_file_tsv, self.table, 
+                                                    self.columns_str)
+
+        retries = 0
+        while True:
+            if not self.is_alive:
+                return False, False
+
+            code, commit_time = self.execute_chunk_trx_infile(cursor, sql)
+            if code > 0:
+                if code == 1: 
+                    return False, False
+                elif code > 1200:
+                    self.logger.info('Chunk copy transaction failed, retrying from %d to %d' % (frompk, topk))
+                    retries += 1
+
+                if retries >= 3:
+                    return False, False
+
+                continue
+
+            self.set_checkpoint(cursor, topk+1, status=1)
+            break
+        
+        return commit_time, rows_count
 
     def run(self):
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -619,10 +713,12 @@ class TableCopier(object):
 
         self.mysql_src = MySQLConnection(self.src_dsn, 'TableCopier, %s, src' % self.table)
         self.mysql_dst = MySQLConnection(self.dst_dsn, 'TableCopier, %s, dst' % self.table)
-        self.pk = self.get_table_primary_key()
-        self.columns = self.get_table_columns()
+        self.get_table_columns()
+        self.get_table_primary_key()
+        
 
         commit_time = 0.0
+        chunk_time = 0.0
         rows_copied = 0
         nextpk = 0
         checkpoint = self.get_checkpoint()
@@ -665,13 +761,17 @@ class TableCopier(object):
                 break
 
             nextpk = self.lastpk + (self.chunk_size - 1)
-            commit_time, rows_copied = self.copy_chunk(cursor, self.lastpk, nextpk)
+
+            chunk_time = time.time()
+            commit_time, rows_copied = self.copy_chunk_func(cursor, self.lastpk, nextpk)
+            chunk_time = time.time() - chunk_time
+
             if not commit_time:
                 self.logger.error('Chunk copy failed, please check logs and try again')
                 return 1
 
-            self.log_event_metrics(rows=rows_copied, frompk=self.lastpk, topk=nextpk, commit_time=commit_time)
-            #time.sleep(1)
+            self.log_event_metrics(rows=rows_copied, frompk=self.lastpk, topk=nextpk, 
+                                   commit_time=commit_time, chunk_time=chunk_time)
             self.lastpk = nextpk + 1
 
             while True and self.max_lag > 0 and self.is_alive and (time.time() - max_replica_lag_time) > 5:
@@ -1046,9 +1146,10 @@ class ReplicationClient(object):
 
         while True:
             try:
-                retcode = self.start_slave(self.checkpoint_committed_binlog_fil, self.checkpoint_committed_binlog_pos)
-            except MySQLdb._exceptions.OperationalError as err:
-                if 'Deadlock found when trying to get lock' in str(err) or 'Lock wait timeout exceeded' in str(err):
+                retcode = self.start_slave(self.checkpoint_committed_binlog_fil, 
+                                           self.checkpoint_committed_binlog_pos)
+            except mysql.connector.Error as err:
+                if err.errno in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
                     if self.trx_open:
                         self.rollback_apply_trx()
                     self.logger.error(str(err))
@@ -1083,10 +1184,11 @@ class MySQLConnection(object):
         results = None
         cursor = mysql.connector.cursor.MySQLCursorDict(self.conn)
         cursor.execute(self.sqlize(sql), args)
-        self.rowcount = cursor.rowcount
         
         if cursor.with_rows:
             results = cursor.fetchall()
+
+        self.rowcount = cursor.rowcount
 
         cursor.close()
         return results
@@ -1095,11 +1197,12 @@ class MySQLConnection(object):
         results = None
         cursor = mysql.connector.cursor.MySQLCursor(self.conn)
         cursor.execute(self.sqlize(sql), args)
-        self.rowcount = cursor.rowcount
 
         if cursor.with_rows:
             results = cursor.fetchall()
-        
+
+        self.rowcount = cursor.rowcount
+
         cursor.close()
         return results
 
@@ -1113,18 +1216,6 @@ class MySQLConnection(object):
             return results[0][column]
 
         return results[0]
-
-    def execute(self, sql, args=None):
-        with warnings.catch_warnings():
-            warnings.filterwarnings('error', category=MySQLdb.Warning)
-            try:
-                cursor = mysql.connector.cursor.MySQLCursorDict(self.conn)
-                cursor.execute(self.sqlize(sql), args)
-            except Warning as db_warning:
-                logger.warning(
-                    "MySQL warning: {}, when executing sql: {}, args: {}"
-                    .format(db_warning, sql, args))
-            return cursor.rowcount
 
     def close(self):
         self.conn.close()
