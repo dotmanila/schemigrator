@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS schemigrator_checkpoint (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """)
 
+schemigrator_tables = [
+    'schemigrator_checksums',
+    'schemigrator_binlog_status',
+    'schemigrator_checkpoint'
+]
+
 def sm_sigterm_handler(signal, frame):
     global SIGTERM_CAUGHT
     print('Signal caught (%s), terminating' % str(signal))
@@ -652,8 +658,11 @@ class TableCopier(object):
 
     def copy_chunk_inout_file(self, cursor, frompk, topk):
         """ Copy chunk specified by range using LOAD DATA INFILE """
-        sql = ('SELECT /* SQL_NO_CACHE */ CONCAT(%s) AS s FROM %s '
-               'WHERE %s BETWEEN %d AND %d') % (',"\\t\\t",'.join('`{}`'.format(escape(col)) for col in self.columns_arr), 
+        if os.path.exists(self.inout_file_tsv):
+            os.unlink(self.inout_file_tsv)
+
+        sql = ('SELECT /* SQL_NO_CACHE */ %s INTO OUTFILE "%s" FIELDS TERMINATED BY "\t\t" FROM %s '
+               'WHERE %s BETWEEN %d AND %d') % (self.columns_str, self.inout_file_tsv, 
                                                 self.table, self.pk, frompk, topk)
         print(sql)
         rows = self.mysql_src.query_array(sql)
@@ -678,7 +687,7 @@ class TableCopier(object):
         chunkfd.close()
 
         vals = ', '.join(['%s'] * self.colcount)
-        sql = ('LOAD DATA INFILE "%s" IGNORE INTO TABLE %s '
+        sql = ('LOAD DATA LOCAL INFILE "%s" IGNORE INTO TABLE %s '
                'FIELDS TERMINATED BY "\t\t" (%s)') % (self.inout_file_tsv, self.table, 
                                                     self.columns_str)
 
@@ -905,6 +914,31 @@ class ReplicationClient(object):
 
         return max_sbm, replica
 
+    def list_bucket_tables(self, from_source=True):
+        sql = ('SELECT TABLE_NAME AS tbl FROM INFORMATION_SCHEMA.TABLES '
+               'WHERE ENGINE="InnoDB" AND TABLE_TYPE="BASE TABLE" AND '
+               'TABLE_SCHEMA="%s"' % self.bucket)
+
+        if from_source:
+            """ TODO: should we make this persistent?
+            """
+            mysql_src = MySQLConnection(self.src_dsn, 'ReplicationClient, src')
+            rows = mysql_src.query(sql)
+            mysql_src.close()
+        else:
+            rows = self.mysql_dst.query(sql)
+
+        if len(rows) == 0:
+            if from_source:
+                self.logger.error('Source bucket has no tables!')
+            return False
+
+        tables = []
+        for row in rows:
+            tables.append(row['tbl'])
+
+        return tables
+
     def get_table_primary_key(self, table):
         mysql_src = MySQLConnection(self.src_dsn, 'ReplicationClient, %s, src' % table)
         sql = ('SELECT column_name AS col FROM information_schema.key_column_usage '
@@ -912,9 +946,9 @@ class ReplicationClient(object):
         pk_columns = mysql_src.query(sql.format(self.bucket, table))
 
         if len(pk_columns) == 0:
-            raise Exception('Table %s has no PRIMARY KEY defined' % self.table)
+            raise Exception('Table %s has no PRIMARY KEY defined' % table)
         elif len(pk_columns) > 1:
-            raise Exception('Table %s has multiple PRIMARY KEY columns' % self.table)
+            raise Exception('Table %s has multiple PRIMARY KEY columns' % table)
 
         mysql_src.close()
         return pk_columns[0]['col']
@@ -968,11 +1002,6 @@ class ReplicationClient(object):
         self.trx_open = False
 
     def update(self, cursor, table, values):
-        """ TODO: This is not optimal, we should cache all PK columns
-        """
-        if table not in self.pkcols:
-            self.pkcols[table] = self.get_table_primary_key(table)
-
         set_pairs = '{0} = %s'.format(' = %s, '.join(values.keys()))
 
         sql = 'UPDATE %s SET %s WHERE %s = %d' % (table, set_pairs, self.pkcols[table], 
@@ -989,9 +1018,6 @@ class ReplicationClient(object):
         self.trx_size += 1
 
     def delete(self, cursor, table, values):
-        if table not in self.pkcols:
-            self.pkcols[table] = self.get_table_primary_key(table)
-
         sql = 'DELETE FROM {0} WHERE {1} = %s'.format(table, self.pkcols[table])
         #self.logger.info('DELETE %d' % values[self.pkcols[table]])
         #self.logger.debug(sql)
@@ -1005,6 +1031,13 @@ class ReplicationClient(object):
             this_binlog_fil = binlog_fil
             this_binlog_pos = binlog_pos
 
+
+        tables = self.list_bucket_tables(from_source=True)
+        for table in tables:
+            if table in schemigrator_tables:
+                continue
+
+            self.pkcols[table] = self.get_table_primary_key(table)
 
         self.logger.info('Starting replication at %s:%d' % (this_binlog_fil, this_binlog_pos))
         stream = BinLogStreamReader(
