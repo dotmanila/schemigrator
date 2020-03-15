@@ -23,7 +23,7 @@ sudo apt install libmysqlclient-dev python3 python3-pip
 pip3 install mysql
 """
 
-VERSION = 0.1
+VERSION = 0.7
 SIGTERM_CAUGHT = False
 logger = None
 
@@ -108,8 +108,13 @@ def sm_buildopts():
     parser.add_option('-X', '--dry-run', dest='dryrun', action="store_true", 
         help=('Show what the script will be doing instead of actually doing it'),
         default=False)
+    parser.add_option('-o', '--use-insert-select', dest='use_insert_select', action="store_true", 
+        help=(('Instead of using SELECT INTO OUTFILE/LOAD DATA INFILE, use native '
+               'and slower simulated INSERT INTO SELECT')),
+        default=False)
 
     (opts, args) = parser.parse_args()
+
     if len(args) != 2:
         parser.error('Source and destination DSNs are required')
 
@@ -143,6 +148,10 @@ def sm_buildopts():
     if len(opts.replica_dsns) > 0:
         for replica in opts.replica_dsns:
             opts.replicas.append(sm_copy_dsn(opts.dst_dsn, sm_parse_dsn(replica)))
+
+    opts.use_inout_file = True
+    if opts.use_insert_select:
+        opts.use_inout_file = False
 
     opts.ppid = os.getpid()
     opts.pcwd = os.path.dirname(os.path.realpath(__file__))
@@ -348,13 +357,16 @@ class Schemigrate(object):
         copier = TableCopier(self.opts.src_dsn, self.opts.dst_dsn, self.opts.bucket, table, 
                              debug=self.opts.debug, pause_file=self.opts.pause_file, stop_file=self.opts.stop_file,
                              chunk_size=self.opts.chunk_size, replica_dsns=self.opts.replicas, 
-                             max_lag=self.opts.max_lag)
+                             max_lag=self.opts.max_lag, use_inout_file=self.opts.use_inout_file)
         copier.run()
 
     def run_replication_client(self, binlog_fil, binlog_pos):
-        repl = ReplicationClient(self.opts.src_dsn, self.opts.dst_dsn, self.opts.bucket, binlog_fil, binlog_pos, 
-                                 debug=self.opts.debug, pause_file=self.opts.pause_file, stop_file=self.opts.stop_file,
-                                 chunk_size=self.opts.chunk_size, replica_dsns=self.opts.replicas, 
+        repl = ReplicationClient(self.opts.src_dsn, self.opts.dst_dsn, 
+                                 self.opts.bucket, binlog_fil, binlog_pos, 
+                                 debug=self.opts.debug, pause_file=self.opts.pause_file, 
+                                 stop_file=self.opts.stop_file, 
+                                 chunk_size=self.opts.chunk_size, 
+                                 replica_dsns=self.opts.replicas, 
                                  max_lag=self.opts.max_lag)
         repl.run()
 
@@ -378,10 +390,9 @@ class Schemigrate(object):
         self.replication_client = Process(target=self.run_replication_client, 
                                           args=(binlog_fil, binlog_pos,), name='replication_client')
         self.replication_client.start()
-
-        #repl = ReplicationClient(self.opts.src_dsn, self.opts.dst_dsn, self.opts.bucket, binlog_fil, binlog_pos, 
-        #                         debug=self.opts.debug, pause_file=self.opts.pause_file, stop_file=self.opts.stop_file)
-        #repl.run()
+        """ TODO: Need to handle if replication client dies i.e. unhandled exception
+        everything needs to stop, same as TableCopier 
+        """
 
         for table in tables:
             self.table_copier = Process(target=self.run_table_copier, args=(table,), name='table_copier')
@@ -402,10 +413,18 @@ class Schemigrate(object):
                 # self.replication_client.terminate()
             time.sleep(3)
 
+        if self.replication_client.exitcode != 0:
+            self.logger.error(('ReplicationClient terminated with code %s'
+                              ) % str(self.replication_client.exitcode))
+
         while self.table_copier.is_alive():
             if not self.is_alive:
                 self.logger.info('Waiting for TableCopier')
             time.sleep(3)
+
+        if self.table_copier.exitcode != 0:
+            self.logger.error(('TableCopier terminated with code %s'
+                              ) % str(self.table_copier.exitcode))
 
         self.logger.info("Done")
         return 0
@@ -596,6 +615,9 @@ class TableCopier(object):
             if err.errno in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
                 return err.errno, commit_ts
             else: 
+                tb = traceback.format_exc().splitlines()
+                for l in tb:
+                    self.logger.error(l)
                 return 1, commit_ts
 
         return 0, commit_ts
@@ -610,9 +632,14 @@ class TableCopier(object):
             self.status = 1
         except mysql.connector.Error as err:
             if err.errno in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
+                self.logger.error(str(err))
                 return err.errno, commit_ts
-            else: 
-                return 1, commit_ts
+            else:
+                self.logger.error(str(err))
+                tb = traceback.format_exc().splitlines()
+                for l in tb:
+                    self.logger.error(l)
+                return err.errno, commit_ts
 
         return 0, commit_ts
 
@@ -664,7 +691,6 @@ class TableCopier(object):
         sql = ('SELECT /* SQL_NO_CACHE */ %s INTO OUTFILE "%s" FIELDS TERMINATED BY "\t\t" FROM %s '
                'WHERE %s BETWEEN %d AND %d') % (self.columns_str, self.inout_file_tsv, 
                                                 self.table, self.pk, frompk, topk)
-        print(sql)
         rows = self.mysql_src.query_array(sql)
         rows_count = 0
 
@@ -673,23 +699,10 @@ class TableCopier(object):
 
         rows_count = self.mysql_src.rowcount
 
-        if not self.mysql_src.rowcount:
-            return None
-
-        rows_count = self.mysql_src.rowcount
-        print(self.mysql_src.rowcount)
-        print(rows)
-        sys.exit(0)
-        with open(self.inout_file_tsv, 'w') as chunkfd:
-            for row in rows:
-                chunkfd.write(row[0])
-
-        chunkfd.close()
-
         vals = ', '.join(['%s'] * self.colcount)
         sql = ('LOAD DATA LOCAL INFILE "%s" IGNORE INTO TABLE %s '
                'FIELDS TERMINATED BY "\t\t" (%s)') % (self.inout_file_tsv, self.table, 
-                                                    self.columns_str)
+                                                      self.columns_str)
 
         retries = 0
         while True:
@@ -698,11 +711,11 @@ class TableCopier(object):
 
             code, commit_time = self.execute_chunk_trx_infile(cursor, sql)
             if code > 0:
-                if code == 1: 
-                    return False, False
-                elif code > 1200:
+                if code in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
                     self.logger.info('Chunk copy transaction failed, retrying from %d to %d' % (frompk, topk))
                     retries += 1
+                else: 
+                    return False, False
 
                 if retries >= 3:
                     return False, False
@@ -721,7 +734,9 @@ class TableCopier(object):
         self.logger.info("Copying table %s" % self.table)
 
         self.mysql_src = MySQLConnection(self.src_dsn, 'TableCopier, %s, src' % self.table)
-        self.mysql_dst = MySQLConnection(self.dst_dsn, 'TableCopier, %s, dst' % self.table)
+
+        self.mysql_dst = MySQLConnection(self.dst_dsn, 'TableCopier, %s, dst' % self.table, 
+                                         allow_local_infile=self.use_inout_file)
         self.get_table_columns()
         self.get_table_primary_key()
         
@@ -976,7 +991,7 @@ class ReplicationClient(object):
         pass
 
     def begin_apply_trx(self):
-        self.mysql_dst.query('BEGIN')
+        self.mysql_dst.conn.start_transaction()
         # We track the time the trx is opened, we do not want to keep a transation open
         # for a very long time even if the number of row events is less than chunk-size
         self.trx_open_ts = time.time()
@@ -988,7 +1003,7 @@ class ReplicationClient(object):
         commit_time_size = 0
 
         commit_time_start = time.time()
-        self.mysql_dst.query('COMMIT')
+        self.mysql_dst.conn.commit()
         commit_time = time.time() - commit_time_start
         commit_time_size = self.trx_size
         self.metrics['commit_size'] += self.trx_size
@@ -997,28 +1012,29 @@ class ReplicationClient(object):
         self.trx_open = False
 
     def rollback_apply_trx(self):
-        self.mysql_dst.query('ROLLBACK')
+        if self.mysql_dst.conn.in_transaction:
+            self.mysql_dst.conn.rollback()
         self.trx_size = 0
         self.trx_open = False
 
     def update(self, cursor, table, values):
-        set_pairs = '{0} = %s'.format(' = %s, '.join(values.keys()))
+        set_pairs = '`{0}`=%s'.format('`=%s,`'.join(values.keys()))
 
-        sql = 'UPDATE %s SET %s WHERE %s = %d' % (table, set_pairs, self.pkcols[table], 
+        sql = 'UPDATE `%s` SET %s WHERE `%s` = %d' % (table, set_pairs, self.pkcols[table], 
                                                   values[self.pkcols[table]])
-        
-        cursor.execute(self.mysql_dst.sqlize(sql), values.values())
+
+        cursor.execute(self.mysql_dst.sqlize(sql), tuple(values.values()))
         self.trx_size += 1
 
     def insert(self, cursor, table, values):
-        sql = 'REPLACE INTO %s (%s) VALUES (%s)' % (table, ', '.join(values.keys()), 
-                                                   ', '.join(['%s'] * len(values)))
+        sql = 'REPLACE INTO `%s` (`%s`) VALUES (%s)' % (table, '`,`'.join(values.keys()), 
+                                                   ','.join(['%s'] * len(values)))
 
-        cursor.execute(self.mysql_dst.sqlize(sql), values.values())
+        cursor.execute(self.mysql_dst.sqlize(sql), tuple(values.values()))
         self.trx_size += 1
 
     def delete(self, cursor, table, values):
-        sql = 'DELETE FROM {0} WHERE {1} = %s'.format(table, self.pkcols[table])
+        sql = 'DELETE FROM `{0}` WHERE `{1}` = %s'.format(table, self.pkcols[table])
         #self.logger.info('DELETE %d' % values[self.pkcols[table]])
         #self.logger.debug(sql)
         cursor.execute(self.mysql_dst.sqlize(sql), (values[self.pkcols[table]], ))
@@ -1120,6 +1136,7 @@ class ReplicationClient(object):
                     self.begin_apply_trx()
 
                 for row in binlogevent.rows:
+                    """ TODO: Should we cover this Exception from self.run()? """
                     try:
                         if binlogevent.table == 'schemigrator_checksums':
                             self.checksum_chunk(row["values"])
@@ -1132,15 +1149,16 @@ class ReplicationClient(object):
 
                         self.metrics['rows'] += 1
                         xid_event = False
-                    except AttributeError as e:
-                        self.logger.error(str(e))
+                    except AttributeError as err:
+                        self.logger.error(str(err))
+
                         event = (binlogevent.schema, binlogevent.table, stream.log_file, int(stream.log_pos))
                         tb = traceback.format_exc().splitlines()
                         for l in tb:
-                            logger.error(l)
+                            self.logger.error(l)
                         self.logger.error("Failed on: %s" % str(event))
                         self.is_alive = False
-                        break
+                        return 1
                     
                     sys.stdout.flush()
 
@@ -1165,9 +1183,7 @@ class ReplicationClient(object):
         return 0
 
     def run(self):
-        """ Start binlog replication process 
-        TODO: What happens if replication dies?
-        """
+        """ Start binlog replication process """
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
 
@@ -1182,11 +1198,19 @@ class ReplicationClient(object):
                 retcode = self.start_slave(self.checkpoint_committed_binlog_fil, 
                                            self.checkpoint_committed_binlog_pos)
             except mysql.connector.Error as err:
+                self.logger.error(str(err))
+
                 if err.errno in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
-                    if self.trx_open:
-                        self.rollback_apply_trx()
-                    self.logger.error(str(err))
+                    self.rollback_apply_trx()
                     self.logger.info('Restarting replication')
+                else:
+                    tb = traceback.format_exc().splitlines()
+                    for l in tb:
+                        self.logger.error(l)
+                    return 1
+            except Exception as err:
+                self.logger.error(str(err))
+                return 1
 
             if retcode == 0:
                 break
@@ -1195,8 +1219,9 @@ class ReplicationClient(object):
 
 
 class MySQLConnection(object):
-    def __init__(self, params, header):
-        self.conn = mysql.connector.connect(**params, autocommit=True, use_pure=True)
+    def __init__(self, params, header='MySQLConnection', allow_local_infile=False):
+        self.conn = mysql.connector.connect(**params, autocommit=True, use_pure=True, 
+                                            allow_local_infile=allow_local_infile)
         self.query_header = header
         self.rowcount = None
 
