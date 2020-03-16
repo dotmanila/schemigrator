@@ -12,6 +12,14 @@ By default, the script uses `SELECT INTO OUTFILE` and `LOAD DATA LOCAL INFILE`, 
 - `local_infile` must be enabled on the destination server, this can be done dynamically with `SET GLOBAL local_infile=1`.
 
 Use the `--use-insert-select` option if you want to be able to run the script from anywhere. This is much slower though as it relies on `mysql.connector.cursor()`'s `executemany()` function and significantly slower even when we are batching commits.
+
+Checksumming is not enabled by default, enable with `--checksum` option explicitly. Checksumming requires that the account used on the source server is able to create a table on the source bucket called `schemigrator_checksums`. Checksum calculations from the source is inserted into this table which in turn the `ReplicationClient` uses this information to compare the checksum on the target. This is a similar and familiar approach with `pt-table-checksum` tool.
+
+## Limitations
+
+- Only supports tables with auto-incrementing single column `PRIMARY KEY`.
+- Table copy is single threaded.
+- On small busy tables, deadlocks may be frequent, try reducing the ReplicationClient chunk size with `--chunk-size-repl`
     
 ## Command Line Options
 

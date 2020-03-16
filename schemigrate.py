@@ -36,13 +36,15 @@ CREATE TABLE IF NOT EXISTS schemigrator_checksums (
    chunk_index    VARCHAR(200)     NULL,
    lower_boundary TEXT             NULL,
    upper_boundary TEXT             NULL,
-   this_crc       CHAR(40)     NOT NULL,
-   this_cnt       INT          NOT NULL,
-   master_crc     CHAR(40)         NULL,
-   master_cnt     INT              NULL,
+   this_crc       CHAR(40)         NULL,
+   this_cnt       INT              NULL,
+   master_crc     CHAR(40)     NOT NULL,
+   master_cnt     INT          NOT NULL,
    ts             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+   chunk_sql      TEXT             NULL,
    PRIMARY KEY (db, tbl, chunk),
-   INDEX ts_db_tbl (ts, db, tbl)
+   INDEX ts_db_tbl (ts, db, tbl),
+   INDEX chunk (chunk)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """)
 
@@ -86,7 +88,13 @@ def sm_buildopts():
     parser.add_option('-B', '--bucket', dest='bucket', type='string',
         help='The bucket/database name to migrate', default=None)
     parser.add_option('-n', '--chunk-size', dest='chunk_size', type='int',
-        help='How many rows to copy at a time', default=1000)
+        help='How many rows per transaction commit', default=1000)
+    parser.add_option('', '--chunk-size-repl', dest='chunk_size_repl', type='int',
+        help=('How many rows per transaction commit for ReplicationClient, '
+              'overrides --chunk-size'), default=0)
+    parser.add_option('', '--chunk-size-copy', dest='chunk_size_copy', type='int',
+        help='How many rows per transaction commit for TableCopier, '
+              'overrides --chunk-size', default=0)
     parser.add_option('-r', '--max-lag', dest='max_lag', type='int',
         help='Max replication lag (seconds) on target to start throttling', default=60)
     parser.add_option('-R', '--replica-dsns', dest='replica_dsns', type='string', action='append', 
@@ -111,6 +119,10 @@ def sm_buildopts():
     parser.add_option('-o', '--use-insert-select', dest='use_insert_select', action="store_true", 
         help=(('Instead of using SELECT INTO OUTFILE/LOAD DATA INFILE, use native '
                'and slower simulated INSERT INTO SELECT')),
+        default=False)
+    parser.add_option('-C', '--checksum', dest='checksum', action="store_true", 
+        help=(('Checksum chunks as they are copied, '
+               'ReplicationClient validates the checksums')),
         default=False)
 
     (opts, args) = parser.parse_args()
@@ -152,6 +164,12 @@ def sm_buildopts():
     opts.use_inout_file = True
     if opts.use_insert_select:
         opts.use_inout_file = False
+
+    if opts.chunk_size_copy == 0:
+        opts.chunk_size_copy = opts.chunk_size
+
+    if opts.chunk_size_repl == 0:
+        opts.chunk_size_repl = opts.chunk_size
 
     opts.ppid = os.getpid()
     opts.pcwd = os.path.dirname(os.path.realpath(__file__))
@@ -283,7 +301,6 @@ class Schemigrate(object):
 
     def setup_metadata_tables(self, tables):
         self.mysql_dst.query(sql_schemigrator_binlog_status)
-        self.mysql_dst.query(sql_schemigrator_checksums)
         self.mysql_dst.query(sql_schemigrator_checkpoint)
 
         for table in tables:
@@ -317,7 +334,8 @@ class Schemigrate(object):
 
         tables = []
         for row in rows:
-            tables.append(row['tbl'])
+            if row['tbl'] not in schemigrator_tables:
+                tables.append(row['tbl'])
 
         return tables
 
@@ -356,8 +374,9 @@ class Schemigrate(object):
     def run_table_copier(self, table):
         copier = TableCopier(self.opts.src_dsn, self.opts.dst_dsn, self.opts.bucket, table, 
                              debug=self.opts.debug, pause_file=self.opts.pause_file, stop_file=self.opts.stop_file,
-                             chunk_size=self.opts.chunk_size, replica_dsns=self.opts.replicas, 
-                             max_lag=self.opts.max_lag, use_inout_file=self.opts.use_inout_file)
+                             chunk_size=self.opts.chunk_size_copy, replica_dsns=self.opts.replicas, 
+                             max_lag=self.opts.max_lag, use_inout_file=self.opts.use_inout_file, 
+                             checksum=self.opts.checksum)
         copier.run()
 
     def run_replication_client(self, binlog_fil, binlog_pos):
@@ -365,7 +384,7 @@ class Schemigrate(object):
                                  self.opts.bucket, binlog_fil, binlog_pos, 
                                  debug=self.opts.debug, pause_file=self.opts.pause_file, 
                                  stop_file=self.opts.stop_file, 
-                                 chunk_size=self.opts.chunk_size, 
+                                 chunk_size=self.opts.chunk_size_repl, 
                                  replica_dsns=self.opts.replicas, 
                                  max_lag=self.opts.max_lag)
         repl.run()
@@ -399,8 +418,15 @@ class Schemigrate(object):
             self.table_copier.start()
 
             while self.is_alive and self.table_copier.is_alive():
+                if not self.replication_client.is_alive():
+                    self.logger.error(('ReplicationClient terminated unexpectedly '
+                                       'terminating TableCopier'))
+                    self.table_copier.terminate()
+                    self.is_alive = False
+                    break
+
                 self.logger.debug("__main_loop_sleep")
-                time.sleep(1)
+                time.sleep(3)
                 
             if not self.is_alive or os.path.exists(self.opts.stop_file):
                 break
@@ -432,16 +458,15 @@ class Schemigrate(object):
 
 class TableCopier(object):
     def __init__(self, src_dsn, dst_dsn, bucket, table, debug=False, pause_file=None, 
-                 stop_file=None, chunk_size=1000, replica_dsns=[], max_lag=0, use_inout_file=True):
-        # Grab SHOW CREATE TABLE from source
-        # Identify if there is PK/UK
-        # Get MIN/MAX PK/UK, record to checkpoint table
+                 stop_file=None, chunk_size=1000, replica_dsns=[], max_lag=0, 
+                 use_inout_file=True, checksum=False):
         self.bucket = bucket
         self.table = table
         self.logger = sm_create_logger(debug, 'TableCopier (%s)' % self.table)
         self.pk = None
         self.columns_str = None
         self.columns_arr = None
+        self.columns_dict = None
         self.colcount = 0
         self.status = 0
         self.minpk = None
@@ -449,8 +474,6 @@ class TableCopier(object):
         self.pause_file = pause_file
         self.stop_file = stop_file
         self.chunk_size = chunk_size
-        # These variables will only hold chunks that has been successfully 
-        # copied
         self.lastpk = 0
         self.metrics = {}
         self.is_alive = True
@@ -459,17 +482,16 @@ class TableCopier(object):
         self.dst_dsn['db'] = self.bucket
         self.mysql_src = None
         self.mysql_dst = None
-        self.logger.info('My PID is %d' % os.getpid())
         self.mysql_replicas = {}
         self.replica_dsns = replica_dsns
         self.max_lag = max_lag
-        self.connect_replicas()
         self.use_inout_file = use_inout_file
-        self.inout_file_tsv = '/tmp/schemigrator-table-copier-chunk.tsv'
-        
+        self.inout_file_tsv = None
         self.copy_chunk_func = self.copy_chunk_inout_file
-        if not self.use_inout_file:
-            self.copy_chunk_func = self.copy_chunk_select
+        self.checksum = checksum
+        self.row_checksum = None
+        self.chunk_counter = 0
+        self.chunk_sql = None
 
     def signal_handler(self, signal, frame):
         self.logger.info("Signal caught (%s), cleaning up" % str(signal))
@@ -510,6 +532,45 @@ class TableCopier(object):
             self.mysql_replicas['%s:%d' % (dsn['host'], dsn['port'])] = MySQLConnection(dsn, 'TableCopier, replmonitor, dst')
             self.logger.info('Connected to target replica %s:%d' % (dsn['host'], dsn['port']))
 
+        return True
+
+    def setup_for_checksum(self):
+        self.mysql_src.query(sql_schemigrator_checksums)
+
+        if self.columns_dict is None:
+            self.get_table_columns()
+
+        types_str = ['char','varchar','binary','varbinary','blob','text','enum','set','json']
+        rows_checksum = []
+        for column in self.columns_dict:
+            col = ''
+            if column['data_type'].lower() in types_str:
+                col = 'CONVERT(`%s` USING utf8mb4)' % column['col']
+                if column['is_nullable'].lower() != 'no':
+                    col = 'COALESCE(%s, "")' % col
+            else:
+                col = '`%s`' % column['col']
+
+            rows_checksum.append(col)
+
+        self.row_checksum = ("COALESCE(LOWER(CONV(BIT_XOR(CAST(CRC32(CONCAT_WS('#', %s)) "
+                             "AS UNSIGNED)), 10, 16)), 0)") % ', '.join(rows_checksum)
+
+        sql = ("SELECT chunk FROM schemigrator_checksums WHERE db = '{0}' AND tbl = '{1}' "
+               "AND chunk = (SELECT MAX(chunk) FROM schemigrator_checksums WHERE db = '{0}' AND tbl = '{1}')")
+        last_chunk = self.mysql_src.fetchone(sql.format(self.bucket, self.table), 'chunk')
+
+        if last_chunk is not None:
+            self.chunk_counter = last_chunk
+
+        self.chunk_sql = ("REPLACE INTO schemigrator_checksums "
+                          "(db, tbl, chunk, chunk_index, lower_boundary, upper_boundary, "
+                          "master_cnt, master_crc) "
+                          "SELECT '{0}', '{1}', %s, '{2}', %s, %s, COUNT(*) AS cnt, {3} AS crc "
+                          "FROM `{1}` FORCE INDEX(`PRIMARY`) "
+                          "WHERE ((`{2}` >= %s)) AND ((`{2}` <= %s))").format(self.bucket, self.table, 
+                                                                              self.pk, self.row_checksum)
+        
         return True
 
     def max_replica_lag(self, max_lag=60):
@@ -557,8 +618,10 @@ class TableCopier(object):
         return True
 
     def get_table_columns(self):
-        sql = ('SELECT column_name AS col FROM information_schema.columns '
-               'WHERE table_schema = "{0}" AND table_name = "{1}" ORDER BY ordinal_position')
+        sql = ('SELECT column_name AS col, is_nullable, data_type '
+               'FROM information_schema.columns '
+               'WHERE table_schema = "{0}" AND table_name = "{1}" '
+               'ORDER BY ordinal_position')
         columns = self.mysql_src.query(sql.format(self.bucket, self.table))
 
         if columns is None:
@@ -571,8 +634,9 @@ class TableCopier(object):
 
         self.columns_str = list_to_col_str(colarr)
         self.columns_arr = colarr
+        self.columns_dict = columns
 
-        return True
+        return True        
 
     def get_min_max_range(self):
         """ Identify min max PK values we should only operate from """
@@ -587,11 +651,8 @@ class TableCopier(object):
         """ Identify next range of rows """
         pass
 
-    def checksum_chunk(self):
-        pass
-        self.conn.start_transaction()
-        # Calculate checksum
-        self.conn.commit()
+    def checksum_chunk(self, minpk, maxpk):
+        self.mysql_src.query(self.chunk_sql, (self.chunk_counter+1, minpk, maxpk, minpk, maxpk, ))
 
     def execute_chunk_trx_select(self, cursor, sql, rows, topk):
         ts = None
@@ -727,20 +788,33 @@ class TableCopier(object):
         
         return commit_time, rows_count
 
-    def run(self):
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
-
-        self.logger.info("Copying table %s" % self.table)
-
+    def start_copier(self):
         self.mysql_src = MySQLConnection(self.src_dsn, 'TableCopier, %s, src' % self.table)
 
         self.mysql_dst = MySQLConnection(self.dst_dsn, 'TableCopier, %s, dst' % self.table, 
                                          allow_local_infile=self.use_inout_file)
+        self.connect_replicas()
         self.get_table_columns()
         self.get_table_primary_key()
         
+        if self.checksum:
+            self.setup_for_checksum()
 
+        if not self.use_inout_file:
+            self.copy_chunk_func = self.copy_chunk_select
+        else:
+            self.inout_file_tsv = self.mysql_src.get_variable('secure_file_priv')
+            if self.inout_file_tsv == 'NULL':
+                self.logger.error('Source server does not support secure_file_priv')
+                return 1
+            elif self.inout_file_tsv == '':
+                self.inout_file_tsv = '/tmp/schemigrator-chunk-%s.tsv' % self.table
+                self.logger.info('Using %s as chunk TSV INFILE/OUTFILE' % self.inout_file_tsv)
+            else:
+                self.inout_file_tsv = os.path.join(self.inout_file_tsv, 
+                                                   'schemigrator-chunk-%s.tsv' % self.table)
+                self.logger.info('Using %s as chunk TSV INFILE/OUTFILE' % self.inout_file_tsv)
+        
         commit_time = 0.0
         chunk_time = 0.0
         rows_copied = 0
@@ -794,6 +868,9 @@ class TableCopier(object):
                 self.logger.error('Chunk copy failed, please check logs and try again')
                 return 1
 
+            if self.checksum:
+                self.checksum_chunk(self.lastpk, nextpk)
+
             self.log_event_metrics(rows=rows_copied, frompk=self.lastpk, topk=nextpk, 
                                    commit_time=commit_time, chunk_time=chunk_time)
             self.lastpk = nextpk + 1
@@ -815,6 +892,24 @@ class TableCopier(object):
             self.logger.info('Copying %s complete!' % self.table)
         else:
             self.logger.info('Stopping copy at next PK value %d' % self.lastpk)
+
+        return 0
+
+    def run(self):
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+
+        self.logger.info('My PID is %d' % os.getpid())
+        self.logger.info("Copying table %s" % self.table)
+
+        try:
+            self.start_copier()
+        except Exception as err:
+            self.logger.error(str(err))
+            tb = traceback.format_exc().splitlines()
+            for l in tb:
+                self.logger.error(l)
+            return 1
 
         return 0
 
@@ -986,9 +1081,11 @@ class ReplicationClient(object):
         # otherwise just start replication from recent file/pos
         pass
 
-    def checksum_chunk(self, values):
+    def checksum_chunk(self, cursor, values):
         """ Calculate checksum based on row event from binlog stream """
-        pass
+        self.logger.debug(values)
+
+        return True
 
     def begin_apply_trx(self):
         self.mysql_dst.conn.start_transaction()
@@ -1136,10 +1233,12 @@ class ReplicationClient(object):
                     self.begin_apply_trx()
 
                 for row in binlogevent.rows:
-                    """ TODO: Should we cover this Exception from self.run()? """
                     try:
                         if binlogevent.table == 'schemigrator_checksums':
-                            self.checksum_chunk(row["values"])
+                            if isinstance(binlogevent, WriteRowsEvent):
+                                self.checksum_chunk(cursor, row["values"])
+                            elif isinstance(binlogevent, UpdateRowsEvent):
+                                self.checksum_chunk(cursor, row["after_values"])
                         elif isinstance(binlogevent, DeleteRowsEvent):
                             self.delete(cursor, binlogevent.table, row["values"])
                         elif isinstance(binlogevent, UpdateRowsEvent):
@@ -1210,6 +1309,9 @@ class ReplicationClient(object):
                     return 1
             except Exception as err:
                 self.logger.error(str(err))
+                tb = traceback.format_exc().splitlines()
+                for l in tb:
+                    self.logger.error(l)
                 return 1
 
             if retcode == 0:
@@ -1274,6 +1376,14 @@ class MySQLConnection(object):
             return results[0][column]
 
         return results[0]
+
+    def get_variable(self, varname, session=False):
+        if session:
+            sql = 'SELECT @@session.%s AS v' % varname
+        else:
+            sql = 'SELECT @@global.%s AS v' % varname
+
+        return self.fetchone(sql, 'v')
 
     def close(self):
         self.conn.close()
