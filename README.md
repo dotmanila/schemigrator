@@ -20,6 +20,8 @@ Checksumming is not enabled by default, enable with `--checksum` option explicit
 - Only supports tables with auto-incrementing single column `PRIMARY KEY`.
 - Table copy is single threaded.
 - On small busy tables, deadlocks may be frequent, try reducing the ReplicationClient chunk size with `--chunk-size-repl`
+- When `--checksum` is enabled, a checksum table is created and written to on the source bucket server. This means the user should be able to write i.e. `super_read_only`, `read_only`.
+- By default, when using `SELECT INTO OUTFILE`, `LOAD DATA INFILE`, the `FILE` privilege is required for the MySQL user on the source bucket server.
     
 ## Command Line Options
 
@@ -33,7 +35,13 @@ Checksumming is not enabled by default, enable with `--checksum` option explicit
       -B BUCKET, --bucket=BUCKET
                             The bucket/database name to migrate
       -n CHUNK_SIZE, --chunk-size=CHUNK_SIZE
-                            How many rows to copy at a time
+                            How many rows per transaction commit
+      --chunk-size-repl=CHUNK_SIZE_REPL
+                            How many rows per transaction commit for
+                            ReplicationClient, overrides --chunk-size
+      --chunk-size-copy=CHUNK_SIZE_COPY
+                            How many rows per transaction commit for TableCopier,
+                            overrides --chunk-size
       -r MAX_LAG, --max-lag=MAX_LAG
                             Max replication lag (seconds) on target to start
                             throttling
@@ -54,6 +62,8 @@ Checksumming is not enabled by default, enable with `--checksum` option explicit
       -o, --use-insert-select
                             Instead of using SELECT INTO OUTFILE/LOAD DATA INFILE,
                             use native and slower simulated INSERT INTO SELECT
+      -C, --checksum        Checksum chunks as they are copied, ReplicationClient
+                            validates the checksums
 
 
 ## Example

@@ -31,7 +31,7 @@ sql_schemigrator_checksums = ("""
 CREATE TABLE IF NOT EXISTS schemigrator_checksums (
    db             CHAR(64)     NOT NULL,
    tbl            CHAR(64)     NOT NULL,
-   chunk          INT          NOT NULL,
+   chunk          BIGINT       NOT NULL,
    chunk_time     FLOAT            NULL,
    chunk_index    VARCHAR(200)     NULL,
    lower_boundary TEXT             NULL,
@@ -301,6 +301,7 @@ class Schemigrate(object):
 
     def setup_metadata_tables(self, tables):
         self.mysql_dst.query(sql_schemigrator_binlog_status)
+        self.mysql_dst.query(sql_schemigrator_checksums)
         self.mysql_dst.query(sql_schemigrator_checkpoint)
 
         for table in tables:
@@ -386,7 +387,7 @@ class Schemigrate(object):
                                  stop_file=self.opts.stop_file, 
                                  chunk_size=self.opts.chunk_size_repl, 
                                  replica_dsns=self.opts.replicas, 
-                                 max_lag=self.opts.max_lag)
+                                 max_lag=self.opts.max_lag, checksum=self.opts.checksum)
         repl.run()
 
     def run(self):
@@ -490,7 +491,6 @@ class TableCopier(object):
         self.copy_chunk_func = self.copy_chunk_inout_file
         self.checksum = checksum
         self.row_checksum = None
-        self.chunk_counter = 0
         self.chunk_sql = None
 
     def signal_handler(self, signal, frame):
@@ -555,13 +555,6 @@ class TableCopier(object):
 
         self.row_checksum = ("COALESCE(LOWER(CONV(BIT_XOR(CAST(CRC32(CONCAT_WS('#', %s)) "
                              "AS UNSIGNED)), 10, 16)), 0)") % ', '.join(rows_checksum)
-
-        sql = ("SELECT chunk FROM schemigrator_checksums WHERE db = '{0}' AND tbl = '{1}' "
-               "AND chunk = (SELECT MAX(chunk) FROM schemigrator_checksums WHERE db = '{0}' AND tbl = '{1}')")
-        last_chunk = self.mysql_src.fetchone(sql.format(self.bucket, self.table), 'chunk')
-
-        if last_chunk is not None:
-            self.chunk_counter = last_chunk
 
         self.chunk_sql = ("REPLACE INTO schemigrator_checksums "
                           "(db, tbl, chunk, chunk_index, lower_boundary, upper_boundary, "
@@ -652,7 +645,7 @@ class TableCopier(object):
         pass
 
     def checksum_chunk(self, minpk, maxpk):
-        self.mysql_src.query(self.chunk_sql, (self.chunk_counter+1, minpk, maxpk, minpk, maxpk, ))
+        self.mysql_src.query(self.chunk_sql, (minpk, minpk, maxpk, minpk, maxpk, ))
 
     def execute_chunk_trx_select(self, cursor, sql, rows, topk):
         ts = None
@@ -674,8 +667,10 @@ class TableCopier(object):
             self.status = 1
         except mysql.connector.Error as err:
             if err.errno in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
+                self.logger.warn(str(err))
                 return err.errno, commit_ts
             else: 
+                self.logger.error(str(err))
                 tb = traceback.format_exc().splitlines()
                 for l in tb:
                     self.logger.error(l)
@@ -760,6 +755,9 @@ class TableCopier(object):
 
         rows_count = self.mysql_src.rowcount
 
+        """ TODO: Without checksumming, LOAD DATA LOCAL INFILE is significantly faster
+        i.e. 10x, on some tests, need to investigate why that is the case. buffer pool size?
+        """
         vals = ', '.join(['%s'] * self.colcount)
         sql = ('LOAD DATA LOCAL INFILE "%s" IGNORE INTO TABLE %s '
                'FIELDS TERMINATED BY "\t\t" (%s)') % (self.inout_file_tsv, self.table, 
@@ -804,6 +802,7 @@ class TableCopier(object):
             self.copy_chunk_func = self.copy_chunk_select
         else:
             self.inout_file_tsv = self.mysql_src.get_variable('secure_file_priv')
+
             if self.inout_file_tsv == 'NULL':
                 self.logger.error('Source server does not support secure_file_priv')
                 return 1
@@ -811,6 +810,16 @@ class TableCopier(object):
                 self.inout_file_tsv = '/tmp/schemigrator-chunk-%s.tsv' % self.table
                 self.logger.info('Using %s as chunk TSV INFILE/OUTFILE' % self.inout_file_tsv)
             else:
+                try:
+                    with open(os.path.join(self.inout_file_tsv, 'test.tsv'), 'w') as testfd:
+                        testfd.write('schemigrator')
+
+                    testfd.close()
+                except Exception as err:
+                    self.logger.error("Unable to write on secure_file_priv directory %s" % self.inout_file_tsv)
+                    self.logger.error(str(err))
+                    return 1
+
                 self.inout_file_tsv = os.path.join(self.inout_file_tsv, 
                                                    'schemigrator-chunk-%s.tsv' % self.table)
                 self.logger.info('Using %s as chunk TSV INFILE/OUTFILE' % self.inout_file_tsv)
@@ -903,7 +912,7 @@ class TableCopier(object):
         self.logger.info("Copying table %s" % self.table)
 
         try:
-            self.start_copier()
+            return self.start_copier()
         except Exception as err:
             self.logger.error(str(err))
             tb = traceback.format_exc().splitlines()
@@ -917,7 +926,7 @@ class TableCopier(object):
 class ReplicationClient(object):
     def __init__(self, src_dsn, dst_dsn, bucket, binlog_fil=None, binlog_pos=None, 
                  debug=False, pause_file=None, stop_file=None, chunk_size=1000, 
-                 replica_dsns=[], max_lag=0):
+                 replica_dsns=[], max_lag=0, checksum=False):
         # Sync to checkpoint every chunk completion
         self.bucket = bucket
         self.src_dsn = src_dsn
@@ -936,6 +945,9 @@ class ReplicationClient(object):
         self.stop_file = stop_file
         self.chunk_size = chunk_size
         self.pkcols = {}
+        self.columns_str = {}
+        self.columns_arr = {}
+        self.columns_dict = {}
         self.trx_size = 0
         self.trx_open = False
         self.trx_open_ts = None
@@ -946,6 +958,9 @@ class ReplicationClient(object):
         self.replica_dsns = replica_dsns
         self.max_lag = max_lag
         self.connect_replicas()
+        self.checksum = checksum
+        self.row_checksum = {}
+        self.chunk_sql = {}
 
     def signal_handler(self, signal, frame):
         self.logger.info("Signal caught (%s), cleaning up" % str(signal))
@@ -1009,6 +1024,36 @@ class ReplicationClient(object):
 
         return True
 
+    def setup_for_checksum(self, table):
+        sql = None
+        types_str = ['char','varchar','binary','varbinary','blob','text','enum','set','json']
+        rows_checksum = []
+        for column in self.columns_dict[table]:
+            col = ''
+            if column['data_type'].lower() in types_str:
+                col = 'CONVERT(`%s` USING utf8mb4)' % column['col']
+                if column['is_nullable'].lower() != 'no':
+                    col = 'COALESCE(%s, "")' % col
+            else:
+                col = '`%s`' % column['col']
+
+            rows_checksum.append(col)
+
+        sql = ("COALESCE(LOWER(CONV(BIT_XOR(CAST(CRC32(CONCAT_WS('#', %s)) "
+              "AS UNSIGNED)), 10, 16)), 0)")
+        self.row_checksum[table] = sql % ', '.join(rows_checksum)
+
+        sql = ("REPLACE INTO schemigrator_checksums "
+               "(db, tbl, chunk, chunk_index, lower_boundary, upper_boundary, "
+               "master_cnt, master_crc, this_cnt, this_crc) "
+               "SELECT '{0}', '{1}', %s, '{2}', %s, %s, %s, %s, COUNT(*) AS cnt, {3} AS crc "
+               "FROM `{1}` FORCE INDEX(`PRIMARY`) "
+               "WHERE ((`{2}` >= %s)) AND ((`{2}` <= %s))")
+        self.chunk_sql[table] = sql.format(self.bucket, table, self.pkcols[table], 
+                                           self.row_checksum[table])
+
+        return True
+
     def max_replica_lag(self, max_lag=60):
         max_sbm = None
         sbm = 0
@@ -1063,6 +1108,29 @@ class ReplicationClient(object):
         mysql_src.close()
         return pk_columns[0]['col']
 
+    def get_table_columns(self, table):
+        mysql_src = MySQLConnection(self.src_dsn, 'ReplicationClient, %s, src' % table)
+        sql = ('SELECT column_name AS col, is_nullable, data_type '
+               'FROM information_schema.columns '
+               'WHERE table_schema = "{0}" AND table_name = "{1}" '
+               'ORDER BY ordinal_position')
+        columns = mysql_src.query(sql.format(self.bucket, table))
+
+        if columns is None:
+            raise Exception('Table %s has no columns defined' % table)
+
+        colarr = []
+        self.colcount = len(columns)
+        for column in columns:
+            colarr.append(column['col'])
+
+        self.columns_str[table] = list_to_col_str(colarr)
+        self.columns_arr[table] = colarr
+        self.columns_dict[table] = columns
+        mysql_src.close()
+
+        return True
+
     def checkpoint_write(self, cursor, checkpoint=None):
         """ Write last executed file and position
         Replication checkpoints should be within the same trx as the applied
@@ -1083,7 +1151,13 @@ class ReplicationClient(object):
 
     def checksum_chunk(self, cursor, values):
         """ Calculate checksum based on row event from binlog stream """
-        self.logger.debug(values)
+        if not self.checksum:
+            return True
+
+        vals = (values['chunk'], values['lower_boundary'], values['upper_boundary'],
+                values['master_cnt'], values['master_crc'], values['lower_boundary'],
+                values['upper_boundary'],)
+        self.mysql_dst.query(self.chunk_sql[values['tbl']], vals)
 
         return True
 
@@ -1115,12 +1189,13 @@ class ReplicationClient(object):
         self.trx_open = False
 
     def update(self, cursor, table, values):
-        set_pairs = '`{0}`=%s'.format('`=%s,`'.join(values.keys()))
-
+        set_pairs = '`{0}`=%s'.format('`=%s,`'.join(values['after_values'].keys()))
+        """ TODO: Why does before_values only have the PK value and not the after?
+        """
         sql = 'UPDATE `%s` SET %s WHERE `%s` = %d' % (table, set_pairs, self.pkcols[table], 
-                                                  values[self.pkcols[table]])
+                                                  values['before_values'][self.pkcols[table]])
 
-        cursor.execute(self.mysql_dst.sqlize(sql), tuple(values.values()))
+        cursor.execute(self.mysql_dst.sqlize(sql), tuple(values['after_values'].values()))
         self.trx_size += 1
 
     def insert(self, cursor, table, values):
@@ -1149,8 +1224,10 @@ class ReplicationClient(object):
         for table in tables:
             if table in schemigrator_tables:
                 continue
-
             self.pkcols[table] = self.get_table_primary_key(table)
+            if self.checksum:
+                self.get_table_columns(table)
+                self.setup_for_checksum(table)
 
         self.logger.info('Starting replication at %s:%d' % (this_binlog_fil, this_binlog_pos))
         stream = BinLogStreamReader(
@@ -1242,7 +1319,7 @@ class ReplicationClient(object):
                         elif isinstance(binlogevent, DeleteRowsEvent):
                             self.delete(cursor, binlogevent.table, row["values"])
                         elif isinstance(binlogevent, UpdateRowsEvent):
-                            self.update(cursor, binlogevent.table, row["after_values"])
+                            self.update(cursor, binlogevent.table, row)
                         elif isinstance(binlogevent, WriteRowsEvent):
                             self.insert(cursor, binlogevent.table, row["values"])
 
@@ -1297,12 +1374,17 @@ class ReplicationClient(object):
                 retcode = self.start_slave(self.checkpoint_committed_binlog_fil, 
                                            self.checkpoint_committed_binlog_pos)
             except mysql.connector.Error as err:
-                self.logger.error(str(err))
-
                 if err.errno in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
+                    """ TODO: This retry logic is a bit expensive as it needs to reset 
+                    replication connection and re-download whatever events to retry. A better 
+                    approach might be to cache the events and simply retry those while 
+                    replication is blocking.
+                    """
+                    self.logger.warn(str(err))
                     self.rollback_apply_trx()
                     self.logger.info('Restarting replication')
                 else:
+                    self.logger.error(str(err))
                     tb = traceback.format_exc().splitlines()
                     for l in tb:
                         self.logger.error(l)
