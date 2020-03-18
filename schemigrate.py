@@ -11,6 +11,7 @@ import warnings
 from multiprocessing import Process, Lock, Manager
 from mysql.connector import errorcode
 from optparse import OptionParser
+from pprint import pprint as pp
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.row_event import (
     DeleteRowsEvent, UpdateRowsEvent,
@@ -1189,13 +1190,24 @@ class ReplicationClient(object):
         self.trx_open = False
 
     def update(self, cursor, table, values):
-        set_pairs = '`{0}`=%s'.format('`=%s,`'.join(values['after_values'].keys()))
+        #pp(values)
+        set_vals = {}
+
+        """ TODO: Another possible optimization, handle None values or 
+        exclude them? pymysql-replication presents ALL columns in the before 
+        and after values, including those that were not modified. 
+        """
+        for k in values['after_values'].keys():
+            if values['after_values'][k] is not None:
+                set_vals[k] = values['after_values'][k]
+
+        set_pairs = '`{0}`=%s'.format('`=%s,`'.join(set_vals.keys()))
         """ TODO: Why does before_values only have the PK value and not the after?
         """
         sql = 'UPDATE `%s` SET %s WHERE `%s` = %d' % (table, set_pairs, self.pkcols[table], 
                                                   values['before_values'][self.pkcols[table]])
 
-        cursor.execute(self.mysql_dst.sqlize(sql), tuple(values['after_values'].values()))
+        cursor.execute(self.mysql_dst.sqlize(sql), tuple(set_vals.values()))
         self.trx_size += 1
 
     def insert(self, cursor, table, values):

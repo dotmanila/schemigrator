@@ -22,6 +22,7 @@ Checksumming is not enabled by default, enable with `--checksum` option explicit
 - On small busy tables, deadlocks may be frequent, try reducing the ReplicationClient chunk size with `--chunk-size-repl`
 - When `--checksum` is enabled, a checksum table is created and written to on the source bucket server. This means the user should be able to write i.e. `super_read_only`, `read_only`.
 - By default, when using `SELECT INTO OUTFILE`, `LOAD DATA INFILE`, the `FILE` privilege is required for the MySQL user on the source bucket server.
+- Similarly, when using `INFILE`/`OUTFILE`, the OS user running the script should be able to read and write to the `secure_file_priv` directory. i.e. `sudo usermod -aG mysql ubuntu`
     
 ## Command Line Options
 
