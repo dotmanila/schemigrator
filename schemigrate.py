@@ -965,7 +965,7 @@ class ReplicationClient(object):
 
     def signal_handler(self, signal, frame):
         self.logger.info("Signal caught (%s), cleaning up" % str(signal))
-        self.logger.info("It may take a fee seconds to teardown, you can also KILL -9 %d" % os.getpid())
+        self.logger.info("It may take a few seconds to teardown, you can also kill -9 %d" % os.getpid())
         self.is_alive = False
 
     def sizeof_fmt(self, num, suffix='B'):
@@ -1224,30 +1224,7 @@ class ReplicationClient(object):
         cursor.execute(self.mysql_dst.sqlize(sql), (values[self.pkcols[table]], ))
         self.trx_size += 1
 
-    def start_slave(self, binlog_fil=None, binlog_pos=None):
-        this_binlog_fil = self.binlog_fil
-        this_binlog_pos = self.binlog_pos
-        if binlog_fil is not None:
-            this_binlog_fil = binlog_fil
-            this_binlog_pos = binlog_pos
-
-
-        tables = self.list_bucket_tables(from_source=True)
-        for table in tables:
-            if table in schemigrator_tables:
-                continue
-            self.pkcols[table] = self.get_table_primary_key(table)
-            if self.checksum:
-                self.get_table_columns(table)
-                self.setup_for_checksum(table)
-
-        self.logger.info('Starting replication at %s:%d' % (this_binlog_fil, this_binlog_pos))
-        stream = BinLogStreamReader(
-            connection_settings=self.src_dsn, resume_stream=True,
-            server_id=172313514, log_file=this_binlog_fil, log_pos=this_binlog_pos,
-            only_events=[DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent, XidEvent], 
-            blocking=True)
-        #, only_schemas=[self.bucket]
+    def start_stream_reader(self, stream):
         cursor = None
         max_replica_lag_secs = None
         max_replica_lag_host = None
@@ -1255,9 +1232,6 @@ class ReplicationClient(object):
         # Marks if a binlog event went to a commit, this helps us roll over properly
         # a new GTID event if in case we want to resume replication manually
         xid_event = False
-
-        self.logger.info('Replication client started')
-        self.log_event_metrics(start=True)
 
         for binlogevent in stream:
             #self.logger.debug('__binlogevent_loop')
@@ -1310,6 +1284,7 @@ class ReplicationClient(object):
             zombie subprocesses. There is still a chance if implemented this way when there is 
             absolutely zero traffic.
             """
+            #print('before binlogevent.schema')
             if binlogevent.schema == self.bucket:
 
                 """ For close of open transaction so we can run the checksum safely
@@ -1365,10 +1340,62 @@ class ReplicationClient(object):
                     max_replica_lag_time = time.time()
                     break
 
+        """ This is here in case there are no binlog events coming in """
+        if self.trx_open:
+            self.checkpoint_write(cursor)
+            self.commit_apply_trx()
+            cursor.close()
+
+        self.log_event_metrics(binlog_fil=stream.log_file, binlog_pos=stream.log_pos)
+
+        return 0
+
+    def start_slave(self, binlog_fil=None, binlog_pos=None):
+        this_binlog_fil = self.binlog_fil
+        this_binlog_pos = self.binlog_pos
+        if binlog_fil is not None:
+            this_binlog_fil = binlog_fil
+            this_binlog_pos = binlog_pos
+
+        self.checkpoint_committed_binlog_fil = this_binlog_fil
+        self.checkpoint_committed_binlog_pos = this_binlog_pos
+
+        tables = self.list_bucket_tables(from_source=True)
+        for table in tables:
+            if table in schemigrator_tables:
+                continue
+            self.pkcols[table] = self.get_table_primary_key(table)
+            if self.checksum:
+                self.get_table_columns(table)
+                self.setup_for_checksum(table)
+
+        self.logger.info('Starting replication at %s:%d' % (this_binlog_fil, this_binlog_pos))
+        stream = BinLogStreamReader(
+            connection_settings=self.src_dsn, resume_stream=True,
+            server_id=172313514, log_file=this_binlog_fil, log_pos=this_binlog_pos,
+            only_events=[DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent, XidEvent], 
+            blocking=False, only_schemas=[self.bucket])
+        #, only_schemas=[self.bucket]
+
+        self.logger.info('Replication client started')
+
+        stream_reader_result = 0
+        self.log_event_metrics(start=True)
+        while True:
+            stream_reader_result = self.start_stream_reader(stream)
+            if stream_reader_result > 0 or not self.is_alive:
+                break
+
+            """ We made the replication client non-blocking so we have better control
+            when the binlog is EOF. Downside is frequent replication connects and 
+            disconnects which may show up as annoying in the source error log
+            """
+            time.sleep(5)
+
         stream.close()
         self.logger.info('Replication client stopped on %s:%d' % (self.checkpoint_committed_binlog_fil, 
                                                                   self.checkpoint_committed_binlog_pos))
-        return 0
+        return stream_reader_result
 
     def run(self):
         """ Start binlog replication process """
