@@ -1375,6 +1375,7 @@ class ReplicationClient(object):
             server_id=172313514, log_file=this_binlog_fil, log_pos=this_binlog_pos,
             only_events=[DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent, XidEvent], 
             blocking=False, only_schemas=[self.bucket])
+        """ TODO: See commit 62a37b1 need to measure performance impact of using this now """
         #, only_schemas=[self.bucket]
 
         self.logger.info('Replication client started')

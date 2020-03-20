@@ -89,3 +89,23 @@ With the command above:
 The minimum values for DSNs is the host, this is assuming Python can figure out the rest of the credentials via configuration files.
 
 If for example, the username/password is specified only from the source DSN, the same credentials will be used on the target and `--replica-dsns`.
+
+## Running with virtualenv
+
+On some environments, installing additional Python3 packages may not be possible. For these hosts, we can use `virtualenv` as long as Python3 is available on the host. `python3-pip` might also not be installed by default and can be installed separately.
+
+    sudo apt install python3-pip
+    git clone https://github.com/dotmanila/schemigrator.git
+    pip3 install virtualenv
+    virtualenv -p $(which python3) schemigrator
+    cd schemigrator
+
+The next steps below activates the virtual environment, once activated make sure to install the module requirements after which you can run the script like above.
+
+    source bin/activate
+    pip3 install -r requirements.txt
+
+When done running, exit from the `virtualenv`/sandbox using the following command.
+
+    deactivate
+
