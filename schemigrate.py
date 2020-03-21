@@ -708,7 +708,8 @@ class TableCopier(object):
         rows_count = 0
 
         if not self.mysql_src.rowcount:
-            return None
+            """ Return non-zero as 0.0 is boolean False """
+            return 0.0001, rows_count
 
         rows_count = self.mysql_src.rowcount
 
@@ -752,7 +753,8 @@ class TableCopier(object):
         rows_count = 0
 
         if not self.mysql_src.rowcount:
-            return None
+            """ Return non-zero as 0.0 is boolean False """
+            return 0.0001, rows_count
 
         rows_count = self.mysql_src.rowcount
 
@@ -792,6 +794,15 @@ class TableCopier(object):
 
         self.mysql_dst = MySQLConnection(self.dst_dsn, 'TableCopier, %s, dst' % self.table, 
                                          allow_local_infile=self.use_inout_file)
+
+        checkpoint = self.get_checkpoint()
+        if checkpoint['status'] == 2:
+            self.logger.info('Table has previously completed copy process')
+            return 0
+        elif checkpoint['status'] > 2:
+            self.logger.info('Table had a previous unrecoverable error, aborting')
+            return 1
+
         self.connect_replicas()
         self.get_table_columns()
         self.get_table_primary_key()
@@ -829,7 +840,9 @@ class TableCopier(object):
         chunk_time = 0.0
         rows_copied = 0
         nextpk = 0
-        checkpoint = self.get_checkpoint()
+
+        cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
+
         if checkpoint is None or self.status == 0:
             self.minpk, self.maxpk = self.get_min_max_range()
             self.lastpk = self.minpk
@@ -841,16 +854,14 @@ class TableCopier(object):
 
         if self.maxpk == 0:
             self.logger.info('Table %s has no rows' % self.table)
+            self.set_checkpoint(cursor, 0, status=2)
             return 0
 
-        if self.lastpk >= self.maxpk or self.status == 2:
+        if self.lastpk >= self.maxpk and self.status != 2:
             self.logger.info('Table has completed copy, skipping')
+            self.set_checkpoint(cursor, self.lastpk, status=2)
             return 0
-        elif self.status > 2:
-            self.logger.info('Table has previous unrecoverable error, skipping')
-            return 1
-        
-        cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
+
         max_replica_lag_secs = None
         max_replica_lag_host = None
         max_replica_lag_time = time.time()
@@ -900,6 +911,7 @@ class TableCopier(object):
 
         if self.lastpk >= self.maxpk:
             self.logger.info('Copying %s complete!' % self.table)
+            self.set_checkpoint(cursor, self.lastpk, status=2)
         else:
             self.logger.info('Stopping copy at next PK value %d' % self.lastpk)
 
@@ -951,7 +963,7 @@ class ReplicationClient(object):
         self.columns_dict = {}
         self.trx_size = 0
         self.trx_open = False
-        self.trx_open_ts = None
+        self.trx_open_ts = time.time()
         self.mysql_dst = MySQLConnection(self.dst_dsn, 'ReplicationClient, applier, dst')
         self.mysql_dst.query('SET SESSION innodb_lock_wait_timeout=5')
         self.metrics = {}
@@ -1138,12 +1150,12 @@ class ReplicationClient(object):
         events so that in case of rollback, the checkpoint is also consistent
         """
         checkpoint = (self.bucket, self.checkpoint_next_binlog_fil, self.checkpoint_next_binlog_pos)
-        self.checkpoint_committed_binlog_fil = self.checkpoint_next_binlog_fil
-        self.checkpoint_committed_binlog_pos = self.checkpoint_next_binlog_pos
         
         sql = 'REPLACE INTO schemigrator_binlog_status (bucket, fil, pos) VALUES (%s, %s, %s)'
         cursor.execute(sql, checkpoint)
         self.trx_size += 1
+        self.checkpoint_committed_binlog_fil = self.checkpoint_next_binlog_fil
+        self.checkpoint_committed_binlog_pos = self.checkpoint_next_binlog_pos
 
     def checkpoint_read(self):
         # Read last checkpoint to resume from
@@ -1224,6 +1236,38 @@ class ReplicationClient(object):
         cursor.execute(self.mysql_dst.sqlize(sql), (values[self.pkcols[table]], ))
         self.trx_size += 1
 
+    def checkpoint_begin(self):
+        cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
+        self.begin_apply_trx()
+        return cursor
+
+    def checkpoint_end(self, cursor, fil=None, pos=None, force=False):
+        if force or (self.trx_size >= self.chunk_size or (time.time() - self.trx_open_ts) >= 5):
+            self.checkpoint_write(cursor)
+
+            if self.trx_open:
+                self.commit_apply_trx()
+                cursor.close()
+
+        if fil is not None:
+            self.log_event_metrics(binlog_fil=fil, binlog_pos=pos)
+
+    def halt_or_pause(self):
+        if not self.is_alive:
+            self.logger.info('Terminating binlog event processing')
+            return False
+
+        if os.path.exists(self.stop_file):
+            self.logger.info('Stopped via %s file' % self.stop_file)
+            return False
+
+        while os.path.exists(self.pause_file):
+            self.logger.info('Paused, remove %s to continue' % self.pause_file)
+            time.sleep(5)
+            continue
+
+        return True
+
     def start_stream_reader(self, stream):
         cursor = None
         max_replica_lag_secs = None
@@ -1234,6 +1278,9 @@ class ReplicationClient(object):
         xid_event = False
 
         for binlogevent in stream:
+            """ TODO: This is blocking in the event that there is completely no binlog events
+            coming from the source server
+            """
             #self.logger.debug('__binlogevent_loop')
             self.binlog_pos = int(stream.log_pos)
             self.binlog_fil = stream.log_file
@@ -1245,85 +1292,63 @@ class ReplicationClient(object):
                 # we probably can also use end_log_pos to avoid using continue clause below
                 self.checkpoint_next_binlog_fil = self.binlog_fil
                 self.checkpoint_next_binlog_pos = self.binlog_pos
+
+                """ Short circuit close trx otherwise without matching events it can hold
+                trx open infinitely """
+                if not self.trx_open:
+                    cursor = self.checkpoint_begin()
+                self.checkpoint_end(cursor, fil=stream.log_file, pos=stream.log_pos)
+
+                if not self.halt_or_pause():
+                    break
+
                 continue
 
             """ We put the commit apply here as we need to capture the NEXT
             binlog event file and position into the checkpoint table instead
             of the previous one as long as the COMMIT here succeeds
             """
-            if self.trx_open and xid_event and (self.trx_size >= self.chunk_size or (time.time() - self.trx_open_ts) >= 5):
-                self.checkpoint_write(cursor)
-                self.commit_apply_trx()
-                cursor.close()
+            if xid_event:
+                self.checkpoint_end(cursor)
+                xid_event = False
 
-            if not self.is_alive:
-                self.logger.info('Terminating binlog event processing')
-                break
-
-            if os.path.exists(self.pause_file):
-                self.logger.info('Paused, remove %s to continue' % self.pause_file)
-                time.sleep(5)
-                continue
-
-            if os.path.exists(self.stop_file):
-                self.logger.info('Stopped via %s file' % self.stop_file)
+            if not self.halt_or_pause():
                 break
             
             """ We keep this outside of the bucket check, to make sure that even when there are
             no events for the bucket we checkpoint binlog pos regularly.
             """
-            if not self.trx_open:
-                cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
-                self.begin_apply_trx()
+            if not self.trx_open and binlogevent.table != 'schemigrator_checksums':
+                cursor = self.checkpoint_begin()
 
-            """ When there are no matching event from the stream because of only_schemas
-            this loop blocks at SIGTERM/SIGKILL with `with binlogevent from stream`
-
-            TODO: Ideally the check for the schema should be handled from python-mysql-replication
-            however, there is not SIGNAL handler from the library and doing Ctrl-C will leave us
-            zombie subprocesses. There is still a chance if implemented this way when there is 
-            absolutely zero traffic.
-            """
-            #print('before binlogevent.schema')
-            if binlogevent.schema == self.bucket:
-
-                """ For close of open transaction so we can run the checksum safely
-                """
-                if self.trx_open and self.trx_size > 0 and binlogevent.table == 'schemigrator_checksums':
-                    self.checkpoint_write(cursor)
-                    self.commit_apply_trx()
-                    cursor.close()
-                    cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
-                    self.begin_apply_trx()
-
-                for row in binlogevent.rows:
-                    try:
-                        if binlogevent.table == 'schemigrator_checksums':
-                            if isinstance(binlogevent, WriteRowsEvent):
-                                self.checksum_chunk(cursor, row["values"])
-                            elif isinstance(binlogevent, UpdateRowsEvent):
-                                self.checksum_chunk(cursor, row["after_values"])
-                        elif isinstance(binlogevent, DeleteRowsEvent):
-                            self.delete(cursor, binlogevent.table, row["values"])
+            for row in binlogevent.rows:
+                try:
+                    if binlogevent.table == 'schemigrator_checksums':
+                        if isinstance(binlogevent, WriteRowsEvent):
+                            self.checksum_chunk(cursor, row["values"])
                         elif isinstance(binlogevent, UpdateRowsEvent):
-                            self.update(cursor, binlogevent.table, row)
-                        elif isinstance(binlogevent, WriteRowsEvent):
-                            self.insert(cursor, binlogevent.table, row["values"])
+                            self.checksum_chunk(cursor, row["after_values"])
+                    elif isinstance(binlogevent, DeleteRowsEvent):
+                        self.delete(cursor, binlogevent.table, row["values"])
+                    elif isinstance(binlogevent, UpdateRowsEvent):
+                        self.update(cursor, binlogevent.table, row)
+                    elif isinstance(binlogevent, WriteRowsEvent):
+                        self.insert(cursor, binlogevent.table, row["values"])
 
-                        self.metrics['rows'] += 1
-                        xid_event = False
-                    except AttributeError as err:
-                        self.logger.error(str(err))
+                    self.metrics['rows'] += 1
+                    xid_event = False
+                except AttributeError as err:
+                    self.logger.error(str(err))
 
-                        event = (binlogevent.schema, binlogevent.table, stream.log_file, int(stream.log_pos))
-                        tb = traceback.format_exc().splitlines()
-                        for l in tb:
-                            self.logger.error(l)
-                        self.logger.error("Failed on: %s" % str(event))
-                        self.is_alive = False
-                        return 1
-                    
-                    sys.stdout.flush()
+                    event = (binlogevent.schema, binlogevent.table, stream.log_file, int(stream.log_pos))
+                    tb = traceback.format_exc().splitlines()
+                    for l in tb:
+                        self.logger.error(l)
+                    self.logger.error("Failed on: %s" % str(event))
+                    self.is_alive = False
+                    return 1
+                
+                sys.stdout.flush()
 
             self.log_event_metrics(binlog_fil=stream.log_file, binlog_pos=stream.log_pos)
 
@@ -1341,11 +1366,7 @@ class ReplicationClient(object):
                     break
 
         """ This is here in case there are no binlog events coming in """
-        if self.trx_open:
-            self.checkpoint_write(cursor)
-            self.commit_apply_trx()
-            cursor.close()
-
+        self.checkpoint_end(cursor, force=True)
         self.log_event_metrics(binlog_fil=stream.log_file, binlog_pos=stream.log_pos)
 
         return 0
@@ -1375,8 +1396,6 @@ class ReplicationClient(object):
             server_id=172313514, log_file=this_binlog_fil, log_pos=this_binlog_pos,
             only_events=[DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent, XidEvent], 
             blocking=False, only_schemas=[self.bucket])
-        """ TODO: See commit 62a37b1 need to measure performance impact of using this now """
-        #, only_schemas=[self.bucket]
 
         self.logger.info('Replication client started')
 

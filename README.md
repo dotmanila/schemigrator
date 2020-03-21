@@ -84,6 +84,16 @@ With the command above:
   - `--max-lag` is based on `Seconds_Behind_Master`
   - If a replica is not replicating i.e. `Seconds_Behind_Master` is `NULL` it is not considered to be lagging.
 
+When `--checksum` is enabled, the following query can be used to see if there were inconsistencies in the destination server after all tables has been copied.
+
+    SELECT db, tbl, SUM(this_cnt) AS total_rows, COUNT(*) AS chunks
+    FROM schemigrator_checksums
+    WHERE (
+     master_cnt <> this_cnt
+     OR master_crc <> this_crc
+     OR ISNULL(master_crc) <> ISNULL(this_crc))
+    GROUP BY db, tbl;
+
 ### Some Notes on DSN (Data Source Names)
 
 The minimum values for DSNs is the host, this is assuming Python can figure out the rest of the credentials via configuration files.
