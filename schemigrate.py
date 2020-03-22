@@ -758,9 +758,6 @@ class TableCopier(object):
 
         rows_count = self.mysql_src.rowcount
 
-        """ TODO: Without checksumming, LOAD DATA LOCAL INFILE is significantly faster
-        i.e. 10x, on some tests, need to investigate why that is the case. buffer pool size?
-        """
         vals = ', '.join(['%s'] * self.colcount)
         sql = ('LOAD DATA LOCAL INFILE "%s" IGNORE INTO TABLE %s '
                'FIELDS TERMINATED BY "\t\t" (%s)') % (self.inout_file_tsv, self.table, 
