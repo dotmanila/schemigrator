@@ -19,8 +19,8 @@ Checksumming is not enabled by default, enable with `--checksum` option explicit
 
 - Only supports tables with auto-incrementing single column `PRIMARY KEY`.
 - Table copy is single threaded.
-- On small busy tables, deadlocks may be frequent, try reducing the ReplicationClient chunk size with `--chunk-size-repl`
-- When `--checksum` is enabled, a checksum table is created and written to on the source bucket server. This means the user should be able to write i.e. `super_read_only`, `read_only`.
+- On small busy tables, deadlocks may be frequent, try reducing the ReplicationClient chunk size with `--chunk-size-repl`. It is safe to terminate the current process with `Ctrl+C` to change chunking parameters anytime and restart. The script maintains state and resumes where it left off.
+- When `--checksum` is enabled, a checksum table is created and written to on the source bucket server. This means the user should be able to write i.e. `super_read_only` should be disabled.
 - By default, when using `SELECT INTO OUTFILE`, `LOAD DATA INFILE`, the `FILE` privilege is required for the MySQL user on the source bucket server.
 - Similarly, when using `INFILE`/`OUTFILE`, the OS user running the script should be able to read and write to the `secure_file_priv` directory. i.e. `sudo usermod -aG mysql ubuntu`
     
@@ -73,8 +73,8 @@ Checksumming is not enabled by default, enable with `--checksum` option explicit
         u=msandbox,p=msandbox,h=127.0.0.1,P=5728,D=test \
         h=127.0.0.1,P=10001,u=msandbox,p=msandbox \
         --stop-file=/tmp/schemigrator.stop --pause-file=/tmp/schemigrator.pause \
-        --chunk-size=5000 --replica-dsns h=127.0.0.1,P=10002 \
-        --replica-dsns h=127.0.0.1,P=10003
+        --replica-dsns h=127.0.0.1,P=10002 --replica-dsns h=127.0.0.1,P=10003 \
+        --chunk-size-repl=100 --chunk-size-copy=20000 --checksum
 
 With the command above:
 
@@ -99,6 +99,56 @@ When `--checksum` is enabled, the following query can be used to see if there we
 The minimum values for DSNs is the host, this is assuming Python can figure out the rest of the credentials via configuration files.
 
 If for example, the username/password is specified only from the source DSN, the same credentials will be used on the target and `--replica-dsns`.
+
+Specifying `--bucket` option explicitly takes precedence when the database is specified in the source DSN i.e. `h=localhost,D=dbname`.
+
+### Examples
+
+When the following source and target DSN is specified:
+
+    localhost some-remote-host
+
+- The script assumes being able to login as root, without password using the default local socket on the source and using port 3306 on the target server.
+- Since the `D` value is not specified on the source DSN, the `--bucket` option should be specified explicitly.
+
+    h=10.1.1.2,u=myuser,p=p@ssword h=10.1.1.2,p=AaBbCcDd
+
+- Since the user is not specified on the target DSN, the same user from the source DSN will be used, only with the password explicitly specified on that target DSN.
+
+
+## Use Native MySQL Replication
+
+As soon as all tables have been copied and checksumming is completed, it is recommended, when possible to use MySQL's native replication instead of relying on the script's simulated replication. The former would be faster in this case.
+
+To verify if checksumming is complete, you can use the query below on the target database. If the query result is empty it means that all tables has been copied and checksum has been completed. Of course, also check that there are not bad checksum results above.
+
+    SELECT chkpt.tbl, chkpt.maxpk, COALESCE(chksm.lastsm, 0) AS lastsm 
+    FROM schemigrator_checkpoint chkpt 
+    LEFT JOIN (
+      SELECT tbl, MAX(upper_boundary) lastsm 
+      FROM schemigrator_checksums 
+      GROUP BY tbl
+    ) chksm ON (chkpt.tbl = chksm.tbl) 
+    WHERE chkpt.maxpk > lastsm;
+
+As soon as checksumming and table copy is complete, you can stop the script and configure native replication on the target server. The replication coordinates to use will be displayed when the script is terminated.
+
+    [ReplicationClient       ]_:: Replication client stopped on mysql-bin.000349:540463919
+
+We can use these coordinates to configure replication on the target, however do not start replication immediately.
+
+    CHANGE MASTER TO MASTER_HOST='<source_server_host>', MASTER_USER='usernsame', 
+    MASTER_PASSWORD=’xxxxxxxxxx’, MASTER_LOG_FILE='mysql-bin.000349', 
+    MASTER_LOG_POS=540463919;
+
+Before starting replication, we make sure to replicate only the database we are migrating.
+
+    CHANGE REPLICATION FILTER REPLICATE_DO_DB=(MigratedDBName), REPLICATE_WILD_DO_TABLE=('MigratedDBName.%');
+
+Then replication can be started.
+
+    START SLAVE;
+
 
 ## Running with virtualenv
 

@@ -22,9 +22,15 @@ from pymysqlreplication.event import XidEvent
 """
 sudo apt install libmysqlclient-dev python3 python3-pip
 pip3 install mysql
+
+
+TODO
+Features/Enhancements
+- Support for configuration files on MySQL DSNs
+- Unit and functional tests
 """
 
-VERSION = 0.7
+VERSION = 0.9
 SIGTERM_CAUGHT = False
 logger = None
 
@@ -35,8 +41,8 @@ CREATE TABLE IF NOT EXISTS schemigrator_checksums (
    chunk          BIGINT       NOT NULL,
    chunk_time     FLOAT            NULL,
    chunk_index    VARCHAR(200)     NULL,
-   lower_boundary TEXT             NULL,
-   upper_boundary TEXT             NULL,
+   lower_boundary BIGINT           NULL,
+   upper_boundary BIGINT           NULL,
    this_crc       CHAR(40)         NULL,
    this_cnt       INT              NULL,
    master_crc     CHAR(40)     NOT NULL,
@@ -411,9 +417,6 @@ class Schemigrate(object):
         self.replication_client = Process(target=self.run_replication_client, 
                                           args=(binlog_fil, binlog_pos,), name='replication_client')
         self.replication_client.start()
-        """ TODO: Need to handle if replication client dies i.e. unhandled exception
-        everything needs to stop, same as TableCopier 
-        """
 
         for table in tables:
             self.table_copier = Process(target=self.run_table_copier, args=(table,), name='table_copier')
@@ -1085,8 +1088,6 @@ class ReplicationClient(object):
                'TABLE_SCHEMA="%s"' % self.bucket)
 
         if from_source:
-            """ TODO: should we make this persistent?
-            """
             mysql_src = MySQLConnection(self.src_dsn, 'ReplicationClient, src')
             rows = mysql_src.query(sql)
             mysql_src.close()
@@ -1199,20 +1200,13 @@ class ReplicationClient(object):
         self.trx_open = False
 
     def update(self, cursor, table, values):
-        #pp(values)
         set_vals = {}
 
-        """ TODO: Another possible optimization, handle None values or 
-        exclude them? pymysql-replication presents ALL columns in the before 
-        and after values, including those that were not modified. 
-        """
         for k in values['after_values'].keys():
             if values['after_values'][k] is not None:
                 set_vals[k] = values['after_values'][k]
 
         set_pairs = '`{0}`=%s'.format('`=%s,`'.join(set_vals.keys()))
-        """ TODO: Why does before_values only have the PK value and not the after?
-        """
         sql = 'UPDATE `%s` SET %s WHERE `%s` = %d' % (table, set_pairs, self.pkcols[table], 
                                                   values['before_values'][self.pkcols[table]])
 
@@ -1240,7 +1234,8 @@ class ReplicationClient(object):
 
     def checkpoint_end(self, cursor, fil=None, pos=None, force=False):
         if force or (self.trx_size >= self.chunk_size or (time.time() - self.trx_open_ts) >= 5):
-            self.checkpoint_write(cursor)
+            if cursor is not None:
+                self.checkpoint_write(cursor)
 
             if self.trx_open:
                 self.commit_apply_trx()
@@ -1275,10 +1270,6 @@ class ReplicationClient(object):
         xid_event = False
 
         for binlogevent in stream:
-            """ TODO: This is blocking in the event that there is completely no binlog events
-            coming from the source server
-            """
-            #self.logger.debug('__binlogevent_loop')
             self.binlog_pos = int(stream.log_pos)
             self.binlog_fil = stream.log_file
             
@@ -1421,8 +1412,6 @@ class ReplicationClient(object):
 
         self.logger.info('My PID is %d' % os.getpid())
 
-        #self.binlog_fil = 'log-bin-db04.014493'
-        #self.binlog_pos = 1011862334
         retcode = 1
 
         while True:
@@ -1431,11 +1420,6 @@ class ReplicationClient(object):
                                            self.checkpoint_committed_binlog_pos)
             except mysql.connector.Error as err:
                 if err.errno in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
-                    """ TODO: This retry logic is a bit expensive as it needs to reset 
-                    replication connection and re-download whatever events to retry. A better 
-                    approach might be to cache the events and simply retry those while 
-                    replication is blocking.
-                    """
                     self.logger.warn(str(err))
                     self.rollback_apply_trx()
                     self.logger.info('Restarting replication')
