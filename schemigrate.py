@@ -28,6 +28,9 @@ TODO
 Features/Enhancements
 - Support for configuration files on MySQL DSNs
 - Unit and functional tests
+
+Bugs
+- When using stop file, replication does not stop
 """
 
 VERSION = 0.9
@@ -1251,6 +1254,7 @@ class ReplicationClient(object):
 
         if os.path.exists(self.stop_file):
             self.logger.info('Stopped via %s file' % self.stop_file)
+            self.is_alive = False
             return False
 
         while os.path.exists(self.pause_file):
