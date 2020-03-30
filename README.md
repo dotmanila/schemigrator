@@ -169,3 +169,11 @@ When done running, exit from the `virtualenv`/sandbox using the following comman
 
     deactivate
 
+## Running Tests
+
+    docker build --pull --force-rm --tag schemigrator:latest .
+    docker run --name schemigrator -p 13300:10000 -p 13301:10001 -p 13302:10002 \
+        -p 13303:10003 --detach schemigrator:latest
+    pytest .
+    docker stop schemigrator
+    docker rm schemigrator

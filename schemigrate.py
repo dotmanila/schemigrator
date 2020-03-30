@@ -186,7 +186,7 @@ def sm_buildopts():
 
     return opts
 
-def sm_create_logger(debug, name):
+def sm_create_logger(debug, name, null_handler=False):
     logger = logging.getLogger(name)
     logformat = '%(asctime)s <%(process)d> %(levelname)s_[{0}]_:: %(message)s'.format(name.ljust(24))
 
@@ -196,7 +196,11 @@ def sm_create_logger(debug, name):
         loglevel = logging.INFO
     logger.setLevel(loglevel)
     formatter = logging.Formatter(logformat)
-    streamh = logging.StreamHandler()
+
+    if not null_handler:
+        streamh = logging.StreamHandler()
+    else:
+        streamh = logging.NullHandler()
     streamh.setFormatter(formatter)
     logger.addHandler(streamh)
     
