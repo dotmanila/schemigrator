@@ -1464,7 +1464,6 @@ class MySQLConnection(object):
 
     def sqlize(self, sql):
         sql = '/* %s */ %s' % (self.query_header, sql)
-        logger.debug(sql)
         return sql
 
     def affected_rows(self):
