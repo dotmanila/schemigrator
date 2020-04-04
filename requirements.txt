@@ -3,3 +3,4 @@ mysql-replication==0.21
 mysql-connector-python==8.0.19
 pytest==5.3.5
 pytest-cov==2.8.1
+codecov==2.0.22

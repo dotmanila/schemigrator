@@ -55,9 +55,16 @@ class MySQLControl(object):
             return None
         return results[0][column]
 
-def mysql_conn(port, db=None):
-    params = mysql_params_global
+    def row(self, sql):
+        results = self.query(sql)
+        if len(results) == 0:
+            return None
+        return results[0]
 
+def mysql_conn(port, db=None):
+    params = dict(mysql_params_global)
+
+    params['port'] = port
     if db is not None:
         params['db'] = db
     mysql_ctl_src = MySQLControl(params)
@@ -99,6 +106,7 @@ def init():
     mysql_ctl_src.query(sql_multi_pk)
     mysql_ctl_src = None
 
+    params = dict(mysql_params_global)
     params['port'] = 13301
     params['db'] = None
     mysql_ctl_dst = MySQLControl(params)
@@ -116,7 +124,15 @@ def mysql_src_conn():
 def mysql_dst_conn():
     return mysql_conn(13301, db=None)
 
+@pytest.fixture
+def mysql_dst_conn_bucket():
+    return mysql_conn(13301, db='single_pk')
+
+@pytest.fixture
+def mysql_src_conn_bucket():
+    return mysql_conn(13300, db='single_pk')
 
 if __name__ == "__main__":
     opts, logger, schemigrator = init()
     print(schemigrator.opts.src_dsn)
+

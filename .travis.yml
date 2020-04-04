@@ -11,4 +11,7 @@ before_install:
 - docker ps -a
 
 script:
-- pytest .
+- pytest --cov=./ .
+
+after_success:
+- codecov --token=dcfbd16d-46c0-475c-9463-ad3e2e6b926b
