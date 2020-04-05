@@ -4,6 +4,7 @@ import logging
 import mysql.connector
 import pytest
 import schemigrate
+import string
 
 opts = None
 logger = None
@@ -93,22 +94,42 @@ def init():
     opts.chunk_size_repl = 10
     opts.chunk_size_copy = 100
     opts.max_lag = 10
+
+    opts.replicas = []
+    params = dict(mysql_params_global)
+    params['port'] = 13302
+    opts.replicas.append(params)
+    params = dict(mysql_params_global)
+    params['port'] = 13303
+    opts.replicas.append(params)
+
     schemigrator = schemigrate.Schemigrate(opts, logger)
 
     params = dict(mysql_params_global)
     params['port'] = 13300
+    params['db'] = 'information_schema'
     mysql_ctl_src = MySQLControl(params)
     mysql_ctl_src.query('CREATE DATABASE IF NOT EXISTS single_pk')
     mysql_ctl_src.query('CREATE DATABASE IF NOT EXISTS multi_pk')
     mysql_ctl_src.query('USE single_pk')
     mysql_ctl_src.query(sql_single_pk)
+
+    rows_count = mysql_ctl_src.scalar('SELECT COUNT(*) AS c FROM single_pk', 'c')
+    if int(rows_count) < 3200:
+        sql = 'REPLACE INTO single_pk (autonum, c, n) VALUES (%s, %s, %s)'
+        for n in range(0,26):
+            mysql_ctl_src.query(sql, (n+1, string.ascii_lowercase[n], n+1))
+        sql = 'INSERT INTO single_pk (c, n) SELECT c, n FROM single_pk'
+        for n in range(1,8):
+            mysql_ctl_src.query(sql)
+
     mysql_ctl_src.query('USE multi_pk')
     mysql_ctl_src.query(sql_multi_pk)
     mysql_ctl_src = None
 
     params = dict(mysql_params_global)
     params['port'] = 13301
-    params['db'] = None
+    params['db'] = 'information_schema'
     mysql_ctl_dst = MySQLControl(params)
     mysql_ctl_dst.query('DROP DATABASE IF EXISTS single_pk')
     mysql_ctl_dst.query('DROP DATABASE IF EXISTS multi_pk')

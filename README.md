@@ -1,6 +1,6 @@
 # schemigrator
 
-[![CodeCov](https://codecov.io/gh/dotmanila/schemigrator/branch/master/graph/badge.svg)](https://codecov.io/gh/dotmanila/schemigrator)[![Build Status](https://travis-ci.com/dotmanila/schemigrator.svg?token=7UHM9mfoNRVp5qAhcQg6&branch=master)](https://travis-ci.com/dotmanila/schemigrator)
+[![CodeCov](https://codecov.io/gh/dotmanila/schemigrator/branch/master/graph/badge.svg)](https://codecov.io/gh/dotmanila/schemigrator) [![Build Status](https://travis-ci.com/dotmanila/schemigrator.svg?token=7UHM9mfoNRVp5qAhcQg6&branch=master)](https://travis-ci.com/dotmanila/schemigrator)
 
 ## Requirements
 

@@ -25,4 +25,9 @@ if [ ! -f /opt/mysql/n3/master.info ]; then
     $mn3 -BNe "$sql"
 fi
 
+$msrc -BNe "select @@hostname" || exit 1
+$mn1 -BNe "select @@hostname" || exit 1
+$mn2 -BNe "select @@hostname" || exit 1
+$mn3 -BNe "select @@hostname" || exit 1
+
 exit 0

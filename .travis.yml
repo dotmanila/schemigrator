@@ -9,6 +9,7 @@ before_install:
 - docker build --pull --force-rm --tag schemigrator:latest .
 - docker run --name schemigrator -p 13300:10000 -p 13301:10001 -p 13302:10002 -p 13303:10003 --detach schemigrator:latest
 - docker ps -a
+- eval 'while true; do healthy=$(docker inspect --format "{{.State.Health.Status}}" schemigrator); if [ "x$healthy" == "xhealthy" ]; then break; fi; sleep 1; done'
 
 script:
 - pytest --cov=./ .

@@ -534,6 +534,13 @@ class TableCopier(object):
 
         return True
 
+    def connect_source(self):
+        self.mysql_src = MySQLConnection(self.src_dsn, 'TableCopier, %s, src' % self.table)
+
+    def connect_target(self):
+        self.mysql_dst = MySQLConnection(self.dst_dsn, 'TableCopier, %s, dst' % self.table, 
+                                         allow_local_infile=self.use_inout_file)
+
     def connect_replicas(self):
         self.logger.debug(self.replica_dsns)
         if len(self.replica_dsns) == 0:
@@ -591,6 +598,32 @@ class TableCopier(object):
                 max_sbm = sbm
 
         return max_sbm, replica
+
+    def set_tsv_file(self):
+        inout_file_tsv = self.mysql_src.get_variable('secure_file_priv')
+
+        if inout_file_tsv == 'NULL':
+            self.logger.error('Source server does not support secure_file_priv')
+            return False
+        elif inout_file_tsv == '':
+            inout_file_tsv = '/tmp/schemigrator-chunk-%s.tsv' % self.table
+            self.logger.info('Using %s as chunk TSV INFILE/OUTFILE' % inout_file_tsv)
+        else:
+            try:
+                with open(os.path.join(inout_file_tsv, 'test.tsv'), 'w') as testfd:
+                    testfd.write('schemigrator')
+
+                testfd.close()
+            except Exception as err:
+                self.logger.error("Unable to write on secure_file_priv directory %s" % inout_file_tsv)
+                self.logger.error(str(err))
+                return False
+
+            inout_file_tsv = os.path.join(inout_file_tsv, 
+                                          'schemigrator-chunk-%s.tsv' % self.table)
+            self.logger.info('Using %s as chunk TSV INFILE/OUTFILE' % inout_file_tsv)
+
+        return inout_file_tsv
 
     def get_checkpoint(self):
         """ Read from dest server current checkpoint position for the table """
@@ -797,10 +830,8 @@ class TableCopier(object):
         return commit_time, rows_count
 
     def start_copier(self):
-        self.mysql_src = MySQLConnection(self.src_dsn, 'TableCopier, %s, src' % self.table)
-
-        self.mysql_dst = MySQLConnection(self.dst_dsn, 'TableCopier, %s, dst' % self.table, 
-                                         allow_local_infile=self.use_inout_file)
+        self.connect_source()
+        self.connect_target()
 
         checkpoint = self.get_checkpoint()
         if checkpoint['status'] == 2:
@@ -820,28 +851,9 @@ class TableCopier(object):
         if not self.use_inout_file:
             self.copy_chunk_func = self.copy_chunk_select
         else:
-            self.inout_file_tsv = self.mysql_src.get_variable('secure_file_priv')
-
-            if self.inout_file_tsv == 'NULL':
-                self.logger.error('Source server does not support secure_file_priv')
+            self.inout_file_tsv = self.set_tsv_file()
+            if not self.inout_file_tsv:
                 return 1
-            elif self.inout_file_tsv == '':
-                self.inout_file_tsv = '/tmp/schemigrator-chunk-%s.tsv' % self.table
-                self.logger.info('Using %s as chunk TSV INFILE/OUTFILE' % self.inout_file_tsv)
-            else:
-                try:
-                    with open(os.path.join(self.inout_file_tsv, 'test.tsv'), 'w') as testfd:
-                        testfd.write('schemigrator')
-
-                    testfd.close()
-                except Exception as err:
-                    self.logger.error("Unable to write on secure_file_priv directory %s" % self.inout_file_tsv)
-                    self.logger.error(str(err))
-                    return 1
-
-                self.inout_file_tsv = os.path.join(self.inout_file_tsv, 
-                                                   'schemigrator-chunk-%s.tsv' % self.table)
-                self.logger.info('Using %s as chunk TSV INFILE/OUTFILE' % self.inout_file_tsv)
         
         commit_time = 0.0
         chunk_time = 0.0
