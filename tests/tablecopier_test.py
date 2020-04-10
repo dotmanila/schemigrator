@@ -54,3 +54,30 @@ def test_get_checkpoint(mysql_dst_conn_bucket):
 
 def test_get_min_max_range():
     assert tablecopier.get_min_max_range() == (1, 3700)
+
+def test_copy_chunk_select(monkeypatch):
+    cursor = mysql.connector.cursor.MySQLCursorDict(tablecopier.mysql_dst.conn)
+
+    commit_ts, rows_count = tablecopier.copy_chunk_select(cursor, 1, 1000)
+    assert rows_count == False
+
+    monkeypatch.setattr(tablecopier, 'minpk', 100)
+    monkeypatch.setattr(tablecopier, 'maxpk', 1000)
+    commit_ts, rows_count = tablecopier.copy_chunk_select(cursor, 1, 1000)
+    assert rows_count == 832
+    assert tablecopier.get_checkpoint()['lastpk'] == 1001
+
+def test_copy_chunk_inout_file():
+    cursor = None
+    assert tablecopier.copy_chunk_inout_file(cursor, 1, 1000) == (False, False, )
+
+def test_set_checkpoint(mysql_dst_conn_bucket, monkeypatch):
+    monkeypatch.setattr(tablecopier, 'minpk', 100)
+    monkeypatch.setattr(tablecopier, 'maxpk', 1000)
+    cursor = mysql.connector.cursor.MySQLCursorDict(tablecopier.mysql_dst.conn)
+    assert tablecopier.set_checkpoint(cursor, 1001, status=2) == None
+    assert tablecopier.get_checkpoint()['lastpk'] == 1001
+
+
+
+

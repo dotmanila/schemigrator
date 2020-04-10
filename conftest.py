@@ -135,6 +135,13 @@ def init():
     mysql_ctl_dst.query('DROP DATABASE IF EXISTS multi_pk')
     mysql_ctl_dst = None
 
+    mysql_repl1_conn = mysql_conn(13302, db=None)
+    mysql_repl2_conn = mysql_conn(13303, db=None)
+    mysql_repl1_conn.query('START SLAVE')
+    mysql_repl2_conn.query('START SLAVE')
+    mysql_repl1_conn = None
+    mysql_repl2_conn = None
+
     return opts, logger, schemigrator
 
 @pytest.fixture
@@ -144,6 +151,14 @@ def mysql_src_conn():
 @pytest.fixture
 def mysql_dst_conn():
     return mysql_conn(13301, db=None)
+
+@pytest.fixture
+def mysql_repl1_conn():
+    return mysql_conn(13302, db=None)
+
+@pytest.fixture
+def mysql_repl2_conn():
+    return mysql_conn(13303, db=None)
 
 @pytest.fixture
 def mysql_dst_conn_bucket():
@@ -156,4 +171,10 @@ def mysql_src_conn_bucket():
 if __name__ == "__main__":
     opts, logger, schemigrator = init()
     print(schemigrator.opts.src_dsn)
+    print(opts.dst_dsn)
+    replclient = schemigrate.ReplicationClient(opts.src_dsn, opts.dst_dsn, opts.bucket, binlog_fil=None,
+                                           binlog_pos=None, debug=True, pause_file=None, stop_file=None, 
+                                           chunk_size=1000, replica_dsns=opts.replicas, max_lag=60, 
+                                           checksum=True)
+    replclient.get_table_columns('xxxccc')
 

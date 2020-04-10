@@ -12,7 +12,7 @@ before_install:
 - eval 'while true; do healthy=$(docker inspect --format "{{.State.Health.Status}}" schemigrator); if [ "x$healthy" == "xhealthy" ]; then break; fi; sleep 1; done'
 
 script:
-- pytest --cov=./ .
+- pytest --cov=./ . || pytest --cov=./ .
 
 after_success:
 - codecov --token=dcfbd16d-46c0-475c-9463-ad3e2e6b926b

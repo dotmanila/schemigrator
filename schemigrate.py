@@ -786,6 +786,9 @@ class TableCopier(object):
 
     def copy_chunk_inout_file(self, cursor, frompk, topk):
         """ Copy chunk specified by range using LOAD DATA INFILE """
+        if self.inout_file_tsv is None:
+            return False, False
+
         if os.path.exists(self.inout_file_tsv):
             os.unlink(self.inout_file_tsv)
 
@@ -963,7 +966,6 @@ class ReplicationClient(object):
         self.bucket = bucket
         self.src_dsn = src_dsn
         self.dst_dsn = dst_dsn
-        self.dst_dsn['db'] = self.bucket
         self.binlog_fil = binlog_fil
         self.binlog_pos = binlog_pos
         self.checkpoint_next_binlog_fil = None
@@ -984,7 +986,6 @@ class ReplicationClient(object):
         self.trx_open = False
         self.trx_open_ts = time.time()
         self.mysql_dst = MySQLConnection(self.dst_dsn, 'ReplicationClient, applier, dst')
-        self.mysql_dst.query('SET SESSION innodb_lock_wait_timeout=5')
         self.metrics = {}
         self.mysql_replicas = {}
         self.replica_dsns = replica_dsns
@@ -1146,7 +1147,7 @@ class ReplicationClient(object):
                'ORDER BY ordinal_position')
         columns = mysql_src.query(sql.format(self.bucket, table))
 
-        if columns is None:
+        if columns is None or len(columns) == 0:
             raise Exception('Table %s has no columns defined' % table)
 
         colarr = []
@@ -1268,15 +1269,16 @@ class ReplicationClient(object):
             self.logger.info('Terminating binlog event processing')
             return False
 
-        if os.path.exists(self.stop_file):
+        if self.stop_file is not None and os.path.exists(self.stop_file):
             self.logger.info('Stopped via %s file' % self.stop_file)
             self.is_alive = False
             return False
 
-        while os.path.exists(self.pause_file):
-            self.logger.info('Paused, remove %s to continue' % self.pause_file)
-            time.sleep(5)
-            continue
+        if self.pause_file is not None:
+            while os.path.exists(self.pause_file):
+                self.logger.info('Paused, remove %s to continue' % self.pause_file)
+                time.sleep(5)
+                continue
 
         return True
 
@@ -1429,6 +1431,10 @@ class ReplicationClient(object):
         """ Start binlog replication process """
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
+
+        self.mysql_dst.query('SET SESSION innodb_lock_wait_timeout=5')
+        self.mysql_dst.query('USE %s' % self.bucket)
+        self.dst_dsn['db'] = self.bucket
 
         self.logger.info('My PID is %d' % os.getpid())
 
