@@ -168,6 +168,25 @@ def mysql_dst_conn_bucket():
 def mysql_src_conn_bucket():
     return mysql_conn(13300, db='single_pk')
 
+@pytest.fixture
+def mysql_dst_bootstrap(mysql_dst_conn):
+    def run():
+        mysql_dst_conn.query('CREATE DATABASE IF NOT EXISTS single_pk')
+        mysql_dst_conn.query('USE single_pk')
+        mysql_dst_conn.query('DROP TABLE IF EXISTS single_pk')
+        mysql_dst_conn.query(sql_single_pk)
+        mysql_dst_conn.query(schemigrate.sql_schemigrator_checksums)
+        mysql_dst_conn.query(schemigrate.sql_schemigrator_binlog_status)
+
+    return run
+
+@pytest.fixture
+def mysql_dst_teardown(mysql_dst_conn):
+    def run():
+        mysql_dst_conn.query('DROP DATABASE IF EXISTS single_pk')
+
+    return run
+
 if __name__ == "__main__":
     opts, logger, schemigrator = init()
     print(schemigrator.opts.src_dsn)

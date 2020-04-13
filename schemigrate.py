@@ -33,7 +33,7 @@ Bugs
 - When using stop file, replication does not stop
 """
 
-VERSION = 0.9
+VERSION = 1.0
 SIGTERM_CAUGHT = False
 logger = None
 

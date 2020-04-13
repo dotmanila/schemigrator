@@ -1,6 +1,6 @@
 # schemigrator
 
-[![CodeCov](https://codecov.io/gh/dotmanila/schemigrator/branch/master/graph/badge.svg)](https://codecov.io/gh/dotmanila/schemigrator) [![Build Status](https://travis-ci.com/dotmanila/schemigrator.svg?token=7UHM9mfoNRVp5qAhcQg6&branch=master)](https://travis-ci.com/dotmanila/schemigrator)
+[![CodeCov](https://codecov.io/gh/dotmanila/schemigrator/branch/master/graph/badge.svg?token=SC0J0VTCGJ)](https://codecov.io/gh/dotmanila/schemigrator) [![Build Status](https://travis-ci.com/dotmanila/schemigrator.svg?token=7UHM9mfoNRVp5qAhcQg6&branch=master)](https://travis-ci.com/dotmanila/schemigrator)
 
 ## Requirements
 
@@ -150,6 +150,11 @@ Before starting replication, we make sure to replicate only the database we are 
 Then replication can be started.
 
     START SLAVE;
+
+Once replication is running, `pt-table-checksum` can also be manually ran against the database we have migrated, if needed.
+
+    pt-table-checksum --recursion-method=none --replicate=test.checksums --databases=test \
+        h=127.0.0.1,P=5728,u=msandbox,p=msandbox
 
 
 ## Running with virtualenv
