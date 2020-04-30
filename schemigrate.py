@@ -918,7 +918,8 @@ class TableCopier(object):
                                    commit_time=commit_time, chunk_time=chunk_time)
             self.lastpk = nextpk + 1
 
-            while True and self.max_lag > 0 and self.is_alive and (time.time() - max_replica_lag_time) > 5:
+            while True and self.max_lag > 0 and self.is_alive and (time.time() - max_replica_lag_time) > 5 \
+                    and len(self.replica_dsns) > 0:
                 max_replica_lag_secs, max_replica_lag_host = self.max_replica_lag(max_lag=self.max_lag)
 
                 if max_replica_lag_secs is None:
@@ -1362,7 +1363,8 @@ class ReplicationClient(object):
 
             self.log_event_metrics(binlog_fil=stream.log_file, binlog_pos=stream.log_pos)
 
-            while True and self.max_lag > 0 and self.is_alive and (time.time() - max_replica_lag_time) > 5:
+            while True and self.max_lag > 0 and self.is_alive and (time.time() - max_replica_lag_time) > 5 \
+                    and len(self.replica_dsns) > 0:
                 max_replica_lag_secs, max_replica_lag_host = self.max_replica_lag(max_lag=self.max_lag)
 
                 if max_replica_lag_secs is None:
