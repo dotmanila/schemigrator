@@ -113,7 +113,7 @@ When the following source and target DSN is specified:
 - The script assumes being able to login as root, without password using the default local socket on the source and using port 3306 on the target server.
 - Since the `D` value is not specified on the source DSN, the `--bucket` option should be specified explicitly.
 
-    h=10.1.1.2,u=myuser,p=p@ssword h=10.1.1.2,p=AaBbCcDd
+        h=10.1.1.2,u=myuser,p=p@ssword h=10.1.1.2,p=AaBbCcDd
 
 - Since the user is not specified on the target DSN, the same user from the source DSN will be used, only with the password explicitly specified on that target DSN.
 

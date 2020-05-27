@@ -1378,8 +1378,8 @@ class ReplicationClient(object):
                     break
 
         """ This is here in case there are no binlog events coming in """
-        self.checkpoint_end(cursor, force=True)
-        self.log_event_metrics(binlog_fil=stream.log_file, binlog_pos=stream.log_pos)
+        if self.trx_open:
+            self.checkpoint_end(cursor, fil=stream.log_file, pos=stream.log_pos, force=True)
 
         return 0
 
