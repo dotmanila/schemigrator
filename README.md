@@ -72,7 +72,7 @@ Checksumming is not enabled by default, enable with `--checksum` option explicit
 ## Example
 
     python3 schemigrate.py \
-        u=msandbox,p=msandbox,h=127.0.0.1,P=5728,D=test \
+        u=msandbox,p=msandbox,h=127.0.0.1,P=5728,D=test,A=utf8 \
         h=127.0.0.1,P=10001,u=msandbox,p=msandbox \
         --stop-file=/tmp/schemigrator.stop --pause-file=/tmp/schemigrator.pause \
         --replica-dsns h=127.0.0.1,P=10002 --replica-dsns h=127.0.0.1,P=10003 \
@@ -104,6 +104,15 @@ If for example, the username/password is specified only from the source DSN, the
 
 Specifying `--bucket` option explicitly takes precedence when the database is specified in the source DSN i.e. `h=localhost,D=dbname`.
 
+DSN Keys:
+
+    h: hostname/IP
+    u: username
+    p: password
+    D: database
+    P: port
+    A: character set
+
 ### Examples
 
 When the following source and target DSN is specified:
@@ -117,6 +126,35 @@ When the following source and target DSN is specified:
 
 - Since the user is not specified on the target DSN, the same user from the source DSN will be used, only with the password explicitly specified on that target DSN.
 
+## Character Sets
+
+It is important to be able to provide the correct character set for the source connection and the target. For example, if your application uses `latin1` for its connections, but writes `utf8` data, you will need to specify `latin1` as character set in your source DSN i.e. `A=latin1`.
+
+To identify the correct character set to use, you need to sample your data and identify rows which may have multi byte characters on on them. In the example below, on a `latin1` connection the data looks garbled, but on `utf8` the data is properly displayed.
+
+    mysql> SET NAMES latin1;
+    Query OK, 0 rows affected (0.00 sec)
+    
+    mysql> SELECT * FROM t_utf8 WHERE CONVERT(s USING BINARY) RLIKE CONCAT('[', UNHEX('80'), '-', UNHEX('FF'), ']') LIMIT 1;
+    +----+---------------+
+    | id | s             |
+    +----+---------------+
+    |  1 | �Celebraci�n!   |
+    +----+---------------+
+    1 row in set (0.00 sec)
+    
+    mysql> SET NAMES utf8;
+    Query OK, 0 rows affected (0.00 sec)
+    
+    mysql> SELECT * FROM t_utf8 WHERE CONVERT(s USING BINARY) RLIKE CONCAT('[', UNHEX('80'), '-', UNHEX('FF'), ']') LIMIT 1;
+    +----+-----------------+
+    | id | s               |
+    +----+-----------------+
+    |  1 | ¡Celebración!   |
+    +----+-----------------+
+    1 row in set (0.00 sec) 
+
+In the above example, we should use `A=utf8`.
 
 ## Use Native MySQL Replication
 

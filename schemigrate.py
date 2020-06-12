@@ -84,56 +84,58 @@ schemigrator_tables = [
     'schemigrator_checkpoint'
 ]
 
+
 def sm_sigterm_handler(signal, frame):
     global SIGTERM_CAUGHT
     print('Signal caught (%s), terminating' % str(signal))
     SIGTERM_CAUGHT = True
+
 
 def sm_buildopts():
     opt_usage = "Usage: %prog [options] COMMAND"
     opt_desc = "Migrate databases from one MySQL server to another."
     opt_epilog = ""
     parser = SchemigrateOptionParser(opt_usage, version="%prog " + str(VERSION),
-        description=opt_desc, epilog=opt_epilog)
+                                     description=opt_desc, epilog=opt_epilog)
     parser.add_option('-B', '--bucket', dest='bucket', type='string',
-        help='The bucket/database name to migrate', default=None)
+                      help='The bucket/database name to migrate', default=None)
     parser.add_option('-n', '--chunk-size', dest='chunk_size', type='int',
-        help='How many rows per transaction commit', default=1000)
+                      help='How many rows per transaction commit', default=1000)
     parser.add_option('', '--chunk-size-repl', dest='chunk_size_repl', type='int',
-        help=('How many rows per transaction commit for ReplicationClient, '
-              'overrides --chunk-size'), default=0)
+                      help=('How many rows per transaction commit for ReplicationClient, '
+                            'overrides --chunk-size'), default=0)
     parser.add_option('', '--chunk-size-copy', dest='chunk_size_copy', type='int',
-        help='How many rows per transaction commit for TableCopier, '
-              'overrides --chunk-size', default=0)
+                      help='How many rows per transaction commit for TableCopier, '
+                           'overrides --chunk-size', default=0)
     parser.add_option('-r', '--max-lag', dest='max_lag', type='int',
-        help='Max replication lag (seconds) on target to start throttling', default=60)
-    parser.add_option('-R', '--replica-dsns', dest='replica_dsns', type='string', action='append', 
-        help='Replica DSNs to check for replication lag', default=[])
-    parser.add_option('-d', '--debug', dest='debug', action="store_true", 
-        help='Enable debugging outputs', default=False)
-    parser.add_option('-c', '--defaults-file', dest='dotmycnf', type='string', 
-        help='Path to .my.cnf containing connection credentials to MySQL',
-        default='~/.my.cnf')
-    parser.add_option('-L', '--log', dest='log', type='string', 
-        help='Log output to specified file',
-        default=None)
-    parser.add_option('-x', '--stop-file', dest='stop_file', type='string', 
-        help='When this file exists, the script terminates itself',
-        default=None)
-    parser.add_option('-p', '--pause-file', dest='pause_file', type='string', 
-        help='When this script exists, the script pauses copying and replication',
-        default=None)
-    parser.add_option('-X', '--dry-run', dest='dryrun', action="store_true", 
-        help=('Show what the script will be doing instead of actually doing it'),
-        default=False)
-    parser.add_option('-o', '--use-insert-select', dest='use_insert_select', action="store_true", 
-        help=(('Instead of using SELECT INTO OUTFILE/LOAD DATA INFILE, use native '
-               'and slower simulated INSERT INTO SELECT')),
-        default=False)
-    parser.add_option('-C', '--checksum', dest='checksum', action="store_true", 
-        help=(('Checksum chunks as they are copied, '
-               'ReplicationClient validates the checksums')),
-        default=False)
+                      help='Max replication lag (seconds) on target to start throttling', default=60)
+    parser.add_option('-R', '--replica-dsns', dest='replica_dsns', type='string', action='append',
+                      help='Replica DSNs to check for replication lag', default=[])
+    parser.add_option('-d', '--debug', dest='debug', action="store_true",
+                      help='Enable debugging outputs', default=False)
+    parser.add_option('-c', '--defaults-file', dest='dotmycnf', type='string',
+                      help='Path to .my.cnf containing connection credentials to MySQL',
+                      default='~/.my.cnf')
+    parser.add_option('-L', '--log', dest='log', type='string',
+                      help='Log output to specified file',
+                      default=None)
+    parser.add_option('-x', '--stop-file', dest='stop_file', type='string',
+                      help='When this file exists, the script terminates itself',
+                      default=None)
+    parser.add_option('-p', '--pause-file', dest='pause_file', type='string',
+                      help='When this script exists, the script pauses copying and replication',
+                      default=None)
+    parser.add_option('-X', '--dry-run', dest='dryrun', action="store_true",
+                      help='Show what the script will be doing instead of actually doing it',
+                      default=False)
+    parser.add_option('-o', '--use-insert-select', dest='use_insert_select', action="store_true",
+                      help=(('Instead of using SELECT INTO OUTFILE/LOAD DATA INFILE, use native '
+                             'and slower simulated INSERT INTO SELECT')),
+                      default=False)
+    parser.add_option('-C', '--checksum', dest='checksum', action="store_true",
+                      help=(('Checksum chunks as they are copied, '
+                             'ReplicationClient validates the checksums')),
+                      default=False)
 
     (opts, args) = parser.parse_args()
 
@@ -149,6 +151,9 @@ def sm_buildopts():
 
     if 'port' in opts.dst_dsn:
         opts.dst_dsn['port'] = int(opts.dst_dsn['port'])
+
+    if 'charset' not in opts.dst_dsn and 'charset' in opts.src_dsn:
+        opts.dst_dsn['charset'] = opts.src_dsn['charset']
 
     opts.dst_dsn = sm_copy_dsn(opts.src_dsn, opts.dst_dsn)
     opts.dst_dsn.pop('db', None)
@@ -186,6 +191,7 @@ def sm_buildopts():
 
     return opts
 
+
 def sm_create_logger(debug, name, null_handler=False):
     logger = logging.getLogger(name)
     logformat = '%(asctime)s <%(process)d> %(levelname)s_[{0}]_:: %(message)s'.format(name.ljust(24))
@@ -206,16 +212,17 @@ def sm_create_logger(debug, name, null_handler=False):
     
     return logger
 
+
 def sm_parse_dsn(dsn):
     dsn_keys = {'h': 'host', 'u':'user', 'P':'port', 'p':'passwd', 
-                'S':'socket', 'D': 'db'}
+                'S':'socket', 'D': 'db', 'A': 'charset'}
     params = {}
     if len(dsn) == 0:
         raise Exception('Invalid DSN value')
 
     dsn_parts = dsn.split(',')
     if len(dsn_parts) == 1:
-        if not '=' in dsn:
+        if '=' not in dsn:
             params['host'] = dsn
             return params
 
@@ -233,6 +240,7 @@ def sm_parse_dsn(dsn):
 
     return params 
 
+
 def sm_copy_dsn(src, dest):
     for k in src:
         if k not in dest:
@@ -240,7 +248,10 @@ def sm_copy_dsn(src, dest):
 
     return dest
 
+
 """ Taken from OnlineSchemaChange """
+
+
 def escape(literal):
     """
     Escape the backtick in table/column name
@@ -252,6 +263,7 @@ def escape(literal):
     @rtype :  string
     """
     return literal.replace('`', '``')
+
 
 def list_to_col_str(column_list):
     """Basic helper function for turn a list of column names into a single
@@ -536,10 +548,12 @@ class TableCopier(object):
 
     def connect_source(self):
         self.mysql_src = MySQLConnection(self.src_dsn, 'TableCopier, %s, src' % self.table)
+        self.logger.debug("Source character set: %s" % self.mysql_src.charset)
 
     def connect_target(self):
         self.mysql_dst = MySQLConnection(self.dst_dsn, 'TableCopier, %s, dst' % self.table, 
                                          allow_local_infile=self.use_inout_file)
+        self.logger.debug("Target character set: %s" % self.mysql_dst.charset)
 
     def connect_replicas(self):
         self.logger.debug(self.replica_dsns)
@@ -563,7 +577,7 @@ class TableCopier(object):
         for column in self.columns_dict:
             col = ''
             if column['data_type'].lower() in types_str:
-                col = 'CONVERT(`%s` USING utf8mb4)' % column['col']
+                col = 'CONVERT(`%s` USING binary)' % column['col']
                 if column['is_nullable'].lower() != 'no':
                     col = 'COALESCE(%s, "")' % col
             else:
@@ -689,6 +703,7 @@ class TableCopier(object):
         pass
 
     def checksum_chunk(self, minpk, maxpk):
+        self.logger.debug('Checksum %d > %d' % (minpk, maxpk))
         self.mysql_src.query(self.chunk_sql, (minpk, minpk, maxpk, minpk, maxpk, ))
 
     def execute_chunk_trx_select(self, cursor, sql, rows, topk):
@@ -792,9 +807,11 @@ class TableCopier(object):
         if os.path.exists(self.inout_file_tsv):
             os.unlink(self.inout_file_tsv)
 
-        sql = ('SELECT /* SQL_NO_CACHE */ %s INTO OUTFILE "%s" FIELDS TERMINATED BY "\t\t" FROM %s '
-               'WHERE %s BETWEEN %d AND %d') % (self.columns_str, self.inout_file_tsv, 
-                                                self.table, self.pk, frompk, topk)
+        sql = ('SELECT /* SQL_NO_CACHE */ %s INTO OUTFILE "%s" CHARACTER SET %s '
+               'FIELDS TERMINATED BY "\t\t" FROM %s WHERE %s BETWEEN %d AND %d') % (
+                    self.columns_str, self.inout_file_tsv, self.mysql_src.charset,
+                    self.table, self.pk, frompk, topk)
+
         rows = self.mysql_src.query_array(sql)
         rows_count = 0
 
@@ -805,9 +822,9 @@ class TableCopier(object):
         rows_count = self.mysql_src.rowcount
 
         vals = ', '.join(['%s'] * self.colcount)
-        sql = ('LOAD DATA LOCAL INFILE "%s" IGNORE INTO TABLE %s '
+        sql = ('LOAD DATA LOCAL INFILE "%s" IGNORE INTO TABLE %s CHARACTER SET %s '
                'FIELDS TERMINATED BY "\t\t" (%s)') % (self.inout_file_tsv, self.table, 
-                                                      self.columns_str)
+                                                      self.mysql_src.charset, self.columns_str)
 
         retries = 0
         while True:
@@ -878,6 +895,9 @@ class TableCopier(object):
             self.logger.info('Table %s has no rows' % self.table)
             self.set_checkpoint(cursor, 0, status=2)
             return 0
+        elif self.maxpk == 1:
+            # Artificially inflate maxpk so there is at least one copy loop
+            self.maxpk = 2
 
         if self.lastpk >= self.maxpk and self.status != 2:
             self.logger.info('Table has completed copy, skipping')
@@ -955,8 +975,6 @@ class TableCopier(object):
             for l in tb:
                 self.logger.error(l)
             return 1
-
-        return 0
 
 
 class ReplicationClient(object):
@@ -1065,7 +1083,7 @@ class ReplicationClient(object):
         for column in self.columns_dict[table]:
             col = ''
             if column['data_type'].lower() in types_str:
-                col = 'CONVERT(`%s` USING utf8mb4)' % column['col']
+                col = 'CONVERT(`%s` USING binary)' % column['col']
                 if column['is_nullable'].lower() != 'no':
                     col = 'COALESCE(%s, "")' % col
             else:
@@ -1476,6 +1494,8 @@ class MySQLConnection(object):
                                             allow_local_infile=allow_local_infile)
         self.query_header = header
         self.rowcount = None
+        self.charset = self.fetchone(
+            'SELECT @@session.character_set_connection as charset', 'charset')
 
     def disconnect(self):
         if self.conn:
