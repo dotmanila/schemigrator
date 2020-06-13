@@ -10,7 +10,7 @@ replclient = schemigrate.ReplicationClient(opts.src_dsn, opts.dst_dsn, opts.buck
                                            binlog_pos=None, debug=True, pause_file=None, stop_file=None, 
                                            chunk_size=1000, replica_dsns=opts.replicas, max_lag=60, 
                                            checksum=True)
-
+replclient.connect_target()
 
 def test_sizeof_fmt():
     assert replclient.sizeof_fmt(1023) == '1023.0B'
@@ -62,7 +62,7 @@ def test_get_table_columns(monkeypatch):
 
 
 def test_checkpoint_begin():
-    assert isinstance(replclient.checkpoint_begin(), mysql.connector.cursor.MySQLCursorDict)
+    assert replclient.checkpoint_begin() is True
     assert replclient.trx_open is True
 
 
@@ -87,27 +87,26 @@ def test_setup_for_checksum(monkeypatch):
 def test_checkpoint_write(mysql_dst_bootstrap, mysql_dst_teardown, monkeypatch):
     mysql_dst_bootstrap()
     replclient.mysql_dst.query('USE single_pk')
-    cursor = mysql.connector.cursor.MySQLCursorDict(replclient.mysql_dst.conn)
 
     with pytest.raises(mysql.connector.errors.IntegrityError) as excinfo:
-        assert replclient.checkpoint_write(cursor)
+        assert replclient.checkpoint_write()
 
     monkeypatch.setattr(replclient, 'checkpoint_next_binlog_fil', 'fff')
     monkeypatch.setattr(replclient, 'checkpoint_next_binlog_pos', 10000)
-    assert replclient.checkpoint_write(cursor) is None
+    assert replclient.checkpoint_write() is None
     if replclient.mysql_dst.conn.in_transaction:
         replclient.mysql_dst.conn.rollback()
     mysql_dst_teardown()
 
 
 def test_begin_apply_trx():
-    assert replclient.begin_apply_trx() is None
+    assert replclient.begin_apply_trx() is True
     assert replclient.trx_open is True
     assert replclient.mysql_dst.conn.in_transaction is True
     assert replclient.mysql_dst.conn.rollback() is None
 
 
-def test_insert(mysql_dst_bootstrap, mysql_dst_teardown, mysql_dst_conn, monkeypatch):
+def test_insert(mysql_dst_bootstrap, mysql_dst_teardown, mysql_dst_conn):
     cursor = mysql.connector.cursor.MySQLCursorDict(replclient.mysql_dst.conn)
     mysql_dst_bootstrap()
     values = {'autonum': 1, 'c': 'a', 'n': 1}
@@ -140,9 +139,8 @@ def test_checkpoint_end(mysql_dst_bootstrap, mysql_dst_teardown, monkeypatch):
     monkeypatch.setattr(replclient, 'checkpoint_next_binlog_pos', 100)
     mysql_dst_bootstrap()
     replclient.log_event_metrics(start=True)
-    cursor = replclient.checkpoint_begin()
 
-    assert replclient.checkpoint_end(cursor, force=True, fil='aaa', pos=120) is None
+    assert replclient.checkpoint_end(force=True, fil='aaa', pos=120) is None
     assert replclient.trx_open is False
     assert replclient.mysql_dst.conn.in_transaction is False
     mysql_dst_teardown()
@@ -152,6 +150,20 @@ def test_log_event_metrics():
     assert replclient.log_event_metrics(start=True) is True
     assert replclient.metrics['events'] == 0
     assert replclient.log_event_metrics(binlog_fil='aaa', binlog_pos=120) is True
+
+
+def evaluate_backoff(mysql_dst_bootstrap, mysql_dst_teardown, monkeypatch):
+    monkeypatch.setattr(replclient, 'checkpoint_next_binlog_fil', 'bbb')
+    monkeypatch.setattr(replclient, 'checkpoint_next_binlog_pos', 999)
+    mysql_dst_bootstrap()
+    assert replclient.evaluate_backoff() is True
+    assert replclient.evaluate_backoff() is True
+    monkeypatch.setattr(replclient, 'is_alive', False)
+    assert replclient.evaluate_backoff() is False
+    monkeypatch.setattr(replclient, 'backoff_counter', 3)
+    assert replclient.evaluate_backoff() is False
+    mysql_dst_teardown()
+
 
 
 

@@ -102,6 +102,7 @@ def init():
     params = dict(mysql_params_global)
     params['port'] = 13303
     opts.replicas.append(params)
+    opts.mode = 'parallel'
 
     schemigrator = schemigrate.Schemigrate(opts, logger)
 
