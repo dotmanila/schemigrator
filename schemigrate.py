@@ -27,13 +27,10 @@ pip3 install mysql
 TODO
 Features/Enhancements
 - Support for configuration files on MySQL DSNs
-- Unit and functional tests
 
-Bugs
-- When using stop file, replication does not stop
 """
 
-VERSION = 1.0
+VERSION = 1.1
 SIGTERM_CAUGHT = False
 logger = None
 
@@ -97,6 +94,15 @@ WHERE (
  OR master_crc <> this_crc
  OR ISNULL(master_crc) <> ISNULL(this_crc))
 GROUP BY db, tbl
+""")
+
+sql_checksum_results_bad = ("""
+SELECT COUNT(*) AS chunks
+FROM schemigrator_checksums
+WHERE (
+ master_cnt <> this_cnt
+ OR master_crc <> this_crc
+ OR ISNULL(master_crc) <> ISNULL(this_crc))
 """)
 
 schemigrator_tables = [
@@ -238,8 +244,8 @@ def sm_create_logger(debug, name, null_handler=False):
 
 
 def sm_parse_dsn(dsn):
-    dsn_keys = {'h': 'host', 'u':'user', 'P':'port', 'p':'passwd', 
-                'S':'socket', 'D': 'db', 'A': 'charset'}
+    dsn_keys = {'h': 'host', 'u': 'user', 'P': 'port', 'p': 'passwd',
+                'S': 'socket', 'D': 'db', 'A': 'charset'}
     params = {}
     if len(dsn) == 0:
         raise Exception('Invalid DSN value')
@@ -312,17 +318,6 @@ class Schemigrate(object):
         self.replication_client = None
         self.is_alive = True
         self.checkpoint_only = True if self.opts.mode == 'serialized' else False
-
-        # Validations
-        #   Able to connect from source and to dest
-        #   Create schemigrate_runtime and schemigrate+checkpoint tables
-        #       runtime has runtime configuration vars i.e. chunk size, pause
-        #       these tables will also be used to validate replication
-        #       should we add heartbeat?
-        #   Create database if not exists
-        #   Start replication client
-        #   Continously check if new target is read_only/super_readonly
-        #       We should use credentials that has no SUPER
 
     def signal_handler(self, signal, frame):
         self.logger.info("Signal caught (%s), cleaning up" % str(signal))
@@ -547,7 +542,7 @@ class Schemigrate(object):
 
         # When mode == serialized, resume replication only when all table
         # copy succeeds
-        if self.checkpoint_only and exitcode == 0:
+        if self.checkpoint_only and exitcode == 0 and self.is_alive:
             self.logger.info('Table copy complete, resuming replication')
             binlog_fil, binlog_pos = self.get_binlog_coords()
             self.replication_client = Process(target=self.run_replication_client,
@@ -565,12 +560,13 @@ class Schemigrate(object):
             self.logger.error(('ReplicationClient terminated with code %s'
                               ) % str(self.replication_client.exitcode))
 
-        while self.table_copier.is_alive():
+        # TableCopier can be None if we resume replication only
+        while self.table_copier is not None and self.table_copier.is_alive():
             if not self.is_alive:
                 self.logger.info('Waiting for TableCopier')
             time.sleep(3)
 
-        if self.table_copier.exitcode != 0:
+        if self.table_copier is not None and self.table_copier.exitcode != 0:
             self.logger.error(('TableCopier terminated with code %s'
                               ) % str(self.table_copier.exitcode))
 
@@ -1026,8 +1022,11 @@ class TableCopier(object):
             chunk_time = time.time() - chunk_time
 
             if not commit_time:
-                self.logger.error('Chunk copy failed, please check logs and try again')
-                return 1
+                # Chunk copy did not really fail on forced termination
+                if not self.is_alive:
+                    self.logger.error('Chunk copy failed, please check logs and try again')
+                    return 1
+                break
 
             if self.checksum:
                 self.checksum_chunk(self.lastpk, nextpk)
@@ -1133,6 +1132,7 @@ class ReplicationClient(object):
     def log_event_metrics(self, start=False, binlog_fil=None, binlog_pos=None):
         if start:
             self.metrics['timer'] = time.time()
+            self.metrics['timer_copy'] = time.time()
             self.metrics['events'] = 0
             self.metrics['rows'] = 0
             self.metrics['bytes'] = 0
@@ -1154,11 +1154,9 @@ class ReplicationClient(object):
         self.metrics['binlog_pos_last'] = binlog_pos
 
         if (now - self.metrics['timer']) >= 10:
-            self.logger.info(('File: %s, position: %s, events read: %d, rows applied: %d, '
-                              'size: %s, time: %.2f secs, commit size: %d, commit time: %.3f') % (
-                binlog_fil, binlog_pos, self.metrics['events'], self.metrics['rows'],
-                self.sizeof_fmt(self.metrics['bytes']), (now - self.metrics['timer']),
-                self.metrics['commit_size'], self.metrics['commit_time']))
+            self.logger.info('Status: %s:%s, %d events/r (%s), %d rows/w, %.4f lat (ms)' % (
+                binlog_fil, binlog_pos, self.metrics['events'], self.sizeof_fmt(self.metrics['bytes']),
+                self.metrics['rows'], (self.metrics['commit_time']*1000)))
             self.metrics['timer'] = now
             self.metrics['rows'] = 0
             self.metrics['events'] = 0
@@ -1166,6 +1164,19 @@ class ReplicationClient(object):
             self.metrics['binlog_pos_last'] = 0
             self.metrics['commit_size'] = 0
             self.metrics['commit_time'] = 0.0
+
+        if (now - self.metrics['timer_copy']) >= 60:
+            statuses = self.list_tables_status()
+            if self.checksum:
+                checksum = self.list_checksum_status()
+                checksum_state = ', %d bad chksums' % checksum if checksum > 0 else ', no chksum errors'
+            else:
+                checksum_state = ''
+            self.logger.info("Tables: %d not started, %d in progress, %d complete, %d error%s" %(
+                statuses['not_started'], statuses['in_progress'], statuses['complete'], statuses['error'],
+                checksum_state
+            ))
+            self.metrics['timer_copy'] = now
 
         return True
 
@@ -1252,6 +1263,35 @@ class ReplicationClient(object):
 
         return tables
 
+    def list_tables_status(self):
+        sql = "SELECT status, count(*) as status_group FROM schemigrator_checkpoint GROUP BY status"
+        self.connect_target()
+        statuses = {'not_started': 0, 'in_progress': 0, 'complete': 0, 'error': 0}
+        tables = self.mysql_dst.query_dict(sql)
+
+        if tables is None:
+            return statuses
+
+        for status in tables:
+            if status['status'] == 0:
+                statuses['not_started'] = status['status_group']
+            elif status['status'] == 1:
+                statuses['in_progress'] = status['status_group']
+            elif status['status'] == 2:
+                statuses['complete'] = status['status_group']
+            elif status['status'] > 2:
+                statuses['error'] = status['status_group']
+
+        return statuses
+
+    def list_checksum_status(self):
+        self.connect_target()
+        checksums = self.mysql_dst.fetchone(sql_checksum_results_bad, 'chunks')
+        if checksums is None:
+            return 0
+
+        return checksums
+
     def get_table_primary_key(self, table):
         mysql_src = MySQLConnection(self.src_dsn, 'ReplicationClient, %s, src' % table)
         sql = ('SELECT column_name AS col FROM information_schema.key_column_usage '
@@ -1294,15 +1334,17 @@ class ReplicationClient(object):
         Replication checkpoints should be within the same trx as the applied
         events so that in case of rollback, the checkpoint is also consistent
         """
-        checkpoint = (self.bucket, self.checkpoint_next_binlog_fil, self.checkpoint_next_binlog_pos)
+        if checkpoint is None:
+            checkpoint = (self.bucket, self.checkpoint_next_binlog_fil,
+                          self.checkpoint_next_binlog_pos)
         
         sql = 'REPLACE INTO schemigrator_binlog_status (bucket, fil, pos) VALUES (%s, %s, %s)'
         cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
         cursor.execute(sql, checkpoint)
         cursor.close()
         self.trx_size += 1
-        self.checkpoint_committed_binlog_fil = self.checkpoint_next_binlog_fil
-        self.checkpoint_committed_binlog_pos = self.checkpoint_next_binlog_pos
+        self.checkpoint_committed_binlog_fil = checkpoint[1]
+        self.checkpoint_committed_binlog_pos = checkpoint[2]
 
     def checkpoint_read(self):
         # Read last checkpoint to resume from
@@ -1351,30 +1393,83 @@ class ReplicationClient(object):
 
     def update(self, cursor, table, values):
         set_vals = {}
+        where_vals = {}
 
         for k in values['after_values'].keys():
             if values['after_values'][k] is not None:
                 set_vals[k] = values['after_values'][k]
 
-        set_pairs = '`{0}`=%s'.format('`=%s,`'.join(set_vals.keys()))
-        sql = 'UPDATE `%s` SET %s WHERE `%s` = %d' % (table, set_pairs, self.pkcols[table], 
-                                                  values['before_values'][self.pkcols[table]])
+        for k in values['before_values'].keys():
+            if values['before_values'][k] is not None:
+                where_vals[k] = values['before_values'][k]
 
-        cursor.execute(self.mysql_dst.sqlize(sql), tuple(set_vals.values()))
+        set_pairs = '`{0}`=%s'.format('`=%s,`'.join(set_vals.keys()))
+        where_pairs = '`{0}`=%s'.format('`=%s AND `'.join(where_vals.keys()))
+        sql = 'UPDATE `%s` SET %s WHERE %s' % (table, set_pairs, where_pairs)
+
+        # print(sql)
+        # print(set_pairs, where_pairs)
+        # print(tuple(set_vals.values()) + tuple(where_vals.values()))
+        # print('---------------------------------------------------')
+
+        try:
+            cursor.execute(self.mysql_dst.sqlize(sql), tuple(set_vals.values()) + tuple(where_vals.values()))
+        except mysql.connector.errors.ProgrammingError as err:
+            self.logger.error(sql)
+            self.logger.error(err.errno)
+            self.logger.error(values)
+            raise err
+        except mysql.connector.errors.IntegrityError as err:
+            self.logger.error(sql)
+            self.logger.error(err.errno)
+            self.logger.error(values)
+            raise err
+
         self.trx_size += 1
 
     def insert(self, cursor, table, values):
-        sql = 'REPLACE INTO `%s` (`%s`) VALUES (%s)' % (table, '`,`'.join(values.keys()), 
-                                                   ','.join(['%s'] * len(values)))
+        sql = 'REPLACE INTO `%s` (`%s`) VALUES (%s)' % (table, '`,`'.join(values['values'].keys()),
+                                                        ','.join(['%s'] * len(values['values'])))
+        # print(sql)
+        # print(tuple(values['values'].values()))
+        # print('---------------------------------------------------')
 
-        cursor.execute(self.mysql_dst.sqlize(sql), tuple(values.values()))
+        try:
+            cursor.execute(self.mysql_dst.sqlize(sql), tuple(values['values'].values()))
+        except mysql.connector.errors.ProgrammingError as err:
+            self.logger.error(sql)
+            self.logger.error(values)
+            raise err
+        except mysql.connector.errors.IntegrityError as err:
+            self.logger.error(sql)
+            self.logger.error(values)
+            self.logger.error(err.errno)
+            raise err
+
         self.trx_size += 1
 
     def delete(self, cursor, table, values):
-        sql = 'DELETE FROM `{0}` WHERE `{1}` = %s'.format(table, self.pkcols[table])
-        #self.logger.info('DELETE %d' % values[self.pkcols[table]])
-        #self.logger.debug(sql)
-        cursor.execute(self.mysql_dst.sqlize(sql), (values[self.pkcols[table]], ))
+        where_vals = {}
+
+        for k in values['values'].keys():
+            if values['values'][k] is not None:
+                where_vals[k] = values['values'][k]
+
+        where_pairs = '`{0}`=%s'.format('`=%s AND `'.join(where_vals.keys()))
+        sql = 'DELETE FROM `{0}` WHERE {1}'.format(table, where_pairs)
+
+        # print(sql)
+        # print(where_pairs)
+        # print(tuple(where_vals.values()))
+        # print('---------------------------------------------------')
+
+        try:
+            cursor.execute(self.mysql_dst.sqlize(sql), tuple(where_vals.values()))
+        except mysql.connector.errors.ProgrammingError as err:
+            self.logger.error(sql)
+            self.logger.error(values)
+            raise err
+
         self.trx_size += 1
 
     def checkpoint_begin(self):
@@ -1406,17 +1501,17 @@ class ReplicationClient(object):
                 continue
 
         if self.checkpoint_only:
-            self.logger.info('Checkpoint mode only, completed and exiting now')
+            self.logger.error('Checkpoint mode only, halting!')
             self.is_alive = False
             return False
 
         return True
 
-    def sleep_timer(self, duration):
+    def sleep_timer(self, duration, interval=2):
         slept = 0
         while slept <= duration:
-            time.sleep(2)
-            slept += 2
+            time.sleep(interval)
+            slept += interval
             if not self.halt_or_pause():
                 return False
 
@@ -1519,11 +1614,11 @@ class ReplicationClient(object):
                         elif isinstance(binlogevent, UpdateRowsEvent):
                             self.checksum_chunk(cursor, row["after_values"])
                     elif isinstance(binlogevent, DeleteRowsEvent):
-                        self.delete(cursor, binlogevent.table, row["values"])
+                        self.delete(cursor, binlogevent.table, row)
                     elif isinstance(binlogevent, UpdateRowsEvent):
                         self.update(cursor, binlogevent.table, row)
                     elif isinstance(binlogevent, WriteRowsEvent):
-                        self.insert(cursor, binlogevent.table, row["values"])
+                        self.insert(cursor, binlogevent.table, row)
 
                     self.metrics['rows'] += 1
                     xid_event = False
@@ -1571,6 +1666,11 @@ class ReplicationClient(object):
 
         self.checkpoint_committed_binlog_fil = this_binlog_fil
         self.checkpoint_committed_binlog_pos = this_binlog_pos
+
+        if self.checkpoint_only:
+            self.checkpoint_write((self.bucket, this_binlog_fil, this_binlog_pos, ))
+            self.logger.info('Checkpoint mode only, completed and exiting now')
+            return 0
 
         tables = self.list_bucket_tables(from_source=True)
         for table in tables:
@@ -1652,7 +1752,7 @@ class ReplicationClient(object):
                 break
 
         self.logger.info('Replication client stopped on %s:%d' % (self.checkpoint_committed_binlog_fil,
-                                                                  self.checkpoint_committed_binlog_pos))
+                                                                  int(self.checkpoint_committed_binlog_pos)))
         return 0
 
 
@@ -1714,7 +1814,7 @@ class MySQLConnection(object):
         if len(results) == 0:
             return None
 
-        #logger.debug(results[0])
+        # logger.debug(results[0])
         if column is not None:
             return results[0][column]
 

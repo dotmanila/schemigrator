@@ -177,6 +177,7 @@ def mysql_dst_bootstrap(mysql_dst_conn):
         mysql_dst_conn.query('DROP TABLE IF EXISTS single_pk')
         mysql_dst_conn.query(sql_single_pk)
         mysql_dst_conn.query(schemigrate.sql_schemigrator_checksums)
+        mysql_dst_conn.query(schemigrate.sql_schemigrator_checkpoint)
         mysql_dst_conn.query(schemigrate.sql_schemigrator_binlog_status)
 
     return run

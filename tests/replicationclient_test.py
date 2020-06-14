@@ -70,6 +70,8 @@ def test_halt_or_pause(tmpdir, monkeypatch):
     assert replclient.halt_or_pause() is True
     stop_file = tmpdir.join('schemigrator.stop')
     stop_file.write('x')
+    monkeypatch.setattr(replclient, 'checkpoint_only', True)
+    assert replclient.halt_or_pause() is False
     monkeypatch.setattr(replclient, 'stop_file', str(stop_file.realpath()))
     assert replclient.halt_or_pause() is False
     monkeypatch.setattr(replclient, 'is_alive', False)
@@ -109,11 +111,57 @@ def test_begin_apply_trx():
 def test_insert(mysql_dst_bootstrap, mysql_dst_teardown, mysql_dst_conn):
     cursor = mysql.connector.cursor.MySQLCursorDict(replclient.mysql_dst.conn)
     mysql_dst_bootstrap()
-    values = {'autonum': 1, 'c': 'a', 'n': 1}
+    values = {'values': {'autonum': 1, 'c': 'a', 'n': 1}}
 
     replclient.mysql_dst.query('USE single_pk')
     assert replclient.insert(cursor, 'single_pk', values) is None
-    assert mysql_dst_conn.row('SELECT autonum, c, n FROM single_pk') == values
+    assert mysql_dst_conn.row('SELECT autonum, c, n FROM single_pk') == values['values']
+
+    # No assert here since we use REPLACE INTO
+    # with pytest.raises(mysql.connector.errors.IntegrityError) as excinfo:
+    #    assert replclient.insert(cursor, 'single_pk', values)
+
+    values = {'values': {'autonum': 1, 'c': 'a', 'n': None}}
+
+    with pytest.raises(mysql.connector.errors.IntegrityError) as excinfo:
+        assert replclient.insert(cursor, 'single_pk', values)
+    mysql_dst_teardown()
+
+
+def test_update(mysql_dst_bootstrap, mysql_dst_teardown, mysql_dst_conn):
+    cursor = mysql.connector.cursor.MySQLCursorDict(replclient.mysql_dst.conn)
+    mysql_dst_bootstrap()
+    replclient.mysql_dst.query('USE single_pk')
+
+    values = {'values': {'autonum': 1, 'c': 'a', 'n': 1}}
+    assert replclient.insert(cursor, 'single_pk', values) is None
+
+    values = {'before_values': {'autonum': 1, 'c': 'a', 'n': 1},
+              'after_values': {'autonum': 1, 'c': 'a', 'n': 2}}
+    assert replclient.update(cursor, 'single_pk', values) is None
+    assert mysql_dst_conn.row('SELECT autonum, c, n FROM single_pk') == values['after_values']
+
+    # Force duplicate key error
+    values = {'values': {'autonum': 2, 'c': 'a', 'n': 2}}
+    assert replclient.insert(cursor, 'single_pk', values) is None
+
+    values = {'before_values': {'autonum': 1, 'c': 'a', 'n': 2},
+              'after_values': {'autonum': 2, 'c': 'a', 'n': 2}}
+
+    with pytest.raises(mysql.connector.errors.IntegrityError) as excinfo:
+        assert replclient.update(cursor, 'single_pk', values)
+    mysql_dst_teardown()
+
+
+def test_delete(mysql_dst_bootstrap, mysql_dst_teardown, mysql_dst_conn):
+    cursor = mysql.connector.cursor.MySQLCursorDict(replclient.mysql_dst.conn)
+    mysql_dst_bootstrap()
+    replclient.mysql_dst.query('USE single_pk')
+
+    values = {'values': {'autonum': 1, 'c': 'a', 'n': 1}}
+    assert replclient.insert(cursor, 'single_pk', values) is None
+    assert replclient.delete(cursor, 'single_pk', values) is None
+    assert mysql_dst_conn.row('SELECT autonum, c, n FROM single_pk') is None
     mysql_dst_teardown()
 
 
@@ -164,6 +212,31 @@ def evaluate_backoff(mysql_dst_bootstrap, mysql_dst_teardown, monkeypatch):
     assert replclient.evaluate_backoff() is False
     mysql_dst_teardown()
 
+
+def test_sleep_timer(monkeypatch):
+    monkeypatch.setattr(replclient, 'stop_file', None)
+    monkeypatch.setattr(replclient, 'is_alive', True)
+    monkeypatch.setattr(replclient, 'checkpoint_only', False)
+    assert replclient.sleep_timer(0.4, 0.2) is True
+    monkeypatch.setattr(replclient, 'checkpoint_only', True)
+    assert replclient.sleep_timer(0.4, 0.2) is False
+
+
+def test_backoff_reset(monkeypatch):
+    assert replclient.backoff_reset() is None
+    monkeypatch.setattr(replclient, 'backoff_last_pos', 1)
+    assert replclient.backoff_reset() is None
+    assert replclient.backoff_last_pos is None
+
+
+def test_list_tables_status(mysql_dst_bootstrap, mysql_dst_teardown, mysql_dst_conn):
+    mysql_dst_bootstrap()
+    assert replclient.list_tables_status() == {'not_started': 0, 'in_progress': 0, 'complete': 0, 'error': 0}
+    mysql_dst_conn.query('INSERT INTO schemigrator_checkpoint VALUES ("single_pk", 1, 2, 0, 0)')
+    assert replclient.list_tables_status() == {'not_started': 1, 'in_progress': 0, 'complete': 0, 'error': 0}
+    mysql_dst_conn.query('INSERT INTO schemigrator_checkpoint VALUES ("multi_pk", 1, 2, 0, 3)')
+    assert replclient.list_tables_status() == {'not_started': 1, 'in_progress': 0, 'complete': 0, 'error': 1}
+    mysql_dst_teardown()
 
 
 
