@@ -12,12 +12,14 @@ replclient = schemigrate.ReplicationClient(opts.src_dsn, opts.dst_dsn, opts.buck
                                            checksum=True)
 replclient.connect_target()
 
+
 def test_sizeof_fmt():
     assert replclient.sizeof_fmt(1023) == '1023.0B'
     assert replclient.sizeof_fmt(1048576) == '1.0MiB'
 
 
 def test_max_replica_lag(mysql_repl1_conn, mysql_repl2_conn):
+    replclient.connect_replicas()
     mysql_repl1_conn.query('START SLAVE')
     mysql_repl2_conn.query('START SLAVE')
     max_sbm, replica = replclient.max_replica_lag()

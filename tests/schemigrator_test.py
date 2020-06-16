@@ -86,6 +86,6 @@ def test_get_binlog_coords(mysql_dst_conn_bucket):
 
 
 def test_copy_tables():
-    assert schemigrator.copy_tables([]) is True
+    assert schemigrator.copy_tables([]) == 0
 
 

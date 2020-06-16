@@ -253,8 +253,7 @@ def sm_parse_dsn(dsn):
     dsn_parts = dsn.split(',')
     if len(dsn_parts) == 1:
         if '=' not in dsn:
-            params['host'] = dsn
-            return params
+            dsn_parts = ['h=%s' % dsn.strip()]
 
     for dsn_part in dsn_parts:
         kv = dsn_part.split('=')
@@ -267,6 +266,9 @@ def sm_parse_dsn(dsn):
             params[dsn_keys[kv[0]]] = int(kv[1])
         else:
             params[dsn_keys[kv[0]]] = kv[1]
+
+    # Enforce short connection timeout
+    params['connect_timeout'] = 2
 
     return params 
 
@@ -326,8 +328,12 @@ class Schemigrate(object):
             self.logger.info("Replication client terminated")
 
         if self.table_copier is not None:
-            if self.table_copier.is_alive():
-                self.table_copier.terminate()
+            try:
+                if self.table_copier.is_alive():
+                    self.table_copier.terminate()
+            except AssertionError as err:
+                if 'can only test a child process' not in str(err):
+                    raise err
             self.logger.info("Replication client terminated")
 
         self.logger.info("Waiting for main thread to terminate")
@@ -442,13 +448,13 @@ class Schemigrate(object):
         status = self.mysql_src.fetchone('SHOW MASTER STATUS')
         return status['File'], status['Position']
 
-    def run_table_copier(self, table):
+    def run_table_copier(self, table, return_dict):
         copier = TableCopier(self.opts.src_dsn, self.opts.dst_dsn, self.opts.bucket, table, 
                              debug=self.opts.debug, pause_file=self.opts.pause_file, stop_file=self.opts.stop_file,
                              chunk_size=self.opts.chunk_size_copy, replica_dsns=self.opts.replicas, 
                              max_lag=self.opts.max_lag, use_inout_file=self.opts.use_inout_file, 
                              checksum=self.opts.checksum)
-        copier.run()
+        return_dict['returncode'] = copier.run()
 
     def run_replication_client(self, binlog_fil, binlog_pos, checkpoint_only):
         repl = ReplicationClient(self.opts.src_dsn, self.opts.dst_dsn, 
@@ -459,10 +465,12 @@ class Schemigrate(object):
                                  replica_dsns=self.opts.replicas, 
                                  max_lag=self.opts.max_lag, checksum=self.opts.checksum,
                                  checkpoint_only=checkpoint_only)
-        repl.run()
+        return repl.run()
 
     def start_table_copy(self, table):
-        self.table_copier = Process(target=self.run_table_copier, args=(table,), name='table_copier')
+        manager = Manager()
+        return_dict = manager.dict()
+        self.table_copier = Process(target=self.run_table_copier, args=(table, return_dict, ), name='table_copier')
         self.table_copier.start()
 
         while self.is_alive and self.table_copier.is_alive():
@@ -471,20 +479,22 @@ class Schemigrate(object):
                                    'terminating TableCopier'))
                 self.table_copier.terminate()
                 self.is_alive = False
-                break
+                return 0
 
             self.logger.debug("__main_loop_sleep")
             time.sleep(3)
 
-        return True
+        return return_dict['returncode']
 
     def copy_tables(self, tables):
         for table in tables:
-            self.start_table_copy(table)
+            retcode = self.start_table_copy(table)
+            if retcode is not None and retcode > 0:
+                return retcode
             if not self.is_alive or os.path.exists(self.opts.stop_file):
                 break
 
-        return True
+        return 0
 
     def run(self):
         exitcode = 0
@@ -524,9 +534,12 @@ class Schemigrate(object):
 
             # More to copy
             if len(tables) > 0:
-                self.copy_tables(tables)
+                exitcode = self.copy_tables(tables)
                 # This is dirty, too deep loop within loop and hard to debug
-                if not self.is_alive:
+                # exitcode > 1 is fatal error
+                if not self.is_alive or exitcode > 1:
+                    if self.replication_client.is_alive():
+                        self.replication_client.terminate()
                     break
                 continue
 
@@ -655,7 +668,8 @@ class TableCopier(object):
             return True
         
         for dsn in self.replica_dsns:
-            self.mysql_replicas['%s:%d' % (dsn['host'], dsn['port'])] = MySQLConnection(dsn, 'TableCopier, replmonitor, dst')
+            key = '%s:%d' % (dsn['host'], dsn['port'])
+            self.mysql_replicas[key] = MySQLConnection(dsn, 'TableCopier, replmonitor, dst')
             self.logger.info('Connected to target replica %s:%d' % (dsn['host'], dsn['port']))
 
         return True
@@ -698,6 +712,10 @@ class TableCopier(object):
         replica = None
 
         for replica in self.mysql_replicas.keys():
+            if not self.mysql_replicas[replica].conn.is_connected():
+                self.logger.warning('Lost connection to replica %s, attempting reconnect' % replica)
+                self.mysql_replicas[replica].conn.reconnect(attempts=5, delay=2)
+
             sbm = self.mysql_replicas[replica].seconds_behind_master()
             """ We can short circuit here given max_lag value but we don't to keep the connection
             open, otherwise we have to implement a keepalive somewhere
@@ -868,8 +886,8 @@ class TableCopier(object):
         vals = ', '.join(['%s'] * self.colcount)
         sql = 'INSERT IGNORE INTO %s (%s) VALUES (%s)' % (self.table, self.columns_str, vals)
 
-        #self.logger.debug(sql)
-        #self.logger.debug(rows)
+        # self.logger.debug(sql)
+        # self.logger.debug(rows)
 
         retries = 0
         while True:
@@ -1064,14 +1082,37 @@ class TableCopier(object):
         self.logger.info('My PID is %d' % os.getpid())
         self.logger.info("Copying table %s" % self.table)
 
+        lost_connection_backoff = 10
+        last_connection_failure = time.time()
+
         try:
-            return self.start_copier()
+            while True:
+                try:
+                    return self.start_copier()
+                except mysql.connector.Error as err:
+                    if err.errno in [errorcode.CR_SERVER_LOST_EXTENDED, errorcode.CR_CONN_HOST_ERROR]:
+                        self.logger.warning(str(err))
+                        if lost_connection_backoff >= 80:
+                            self.logger.error('Too many connection failures, giving up')
+                            return 2
+
+                        if (time.time()-last_connection_failure) > 100:
+                            lost_connection_backoff = 10
+
+                        self.logger.info('Waiting %d seconds to reconnect' % lost_connection_backoff)
+                        time.sleep(lost_connection_backoff)
+                        lost_connection_backoff += lost_connection_backoff
+                        last_connection_failure = time.time()
+                    else:
+                        raise err
         except Exception as err:
             self.logger.error(str(err))
-            tb = traceback.format_exc().splitlines()
-            for l in tb:
-                self.logger.error(l)
+            backtrace = traceback.format_exc().splitlines()
+            for line in backtrace:
+                self.logger.error(line)
             return 1
+
+        return 0
 
 
 class ReplicationClient(object):
@@ -1106,7 +1147,6 @@ class ReplicationClient(object):
         self.mysql_replicas = {}
         self.replica_dsns = replica_dsns
         self.max_lag = max_lag
-        self.connect_replicas()
         self.checksum = checksum
         self.checkpoint_only = checkpoint_only
         self.row_checksum = {}
@@ -1190,7 +1230,8 @@ class ReplicationClient(object):
             return True
         
         for dsn in self.replica_dsns:
-            self.mysql_replicas['%s:%d' % (dsn['host'], dsn['port'])] = MySQLConnection(dsn, 'ReplicationClient, replmonitor, dst')
+            key = '%s:%d' % (dsn['host'], dsn['port'])
+            self.mysql_replicas[key] = MySQLConnection(dsn, 'ReplicationClient, replmonitor, dst')
             self.logger.info('Connected to target replica %s:%d' % (dsn['host'], dsn['port']))
 
         return True
@@ -1231,6 +1272,10 @@ class ReplicationClient(object):
         replica = None
 
         for replica in self.mysql_replicas.keys():
+            if not self.mysql_replicas[replica].conn.is_connected():
+                self.logger.warning('Lost connection to replica %s, attempting reconnect' % replica)
+                self.mysql_replicas[replica].conn.reconnect(attempts=5, delay=2)
+
             sbm = self.mysql_replicas[replica].seconds_behind_master()
             """ We can short circuit here given max_lag value but we don't to keep the connection
             open, otherwise we have to implement a keepalive somewhere
@@ -1714,10 +1759,14 @@ class ReplicationClient(object):
         self.logger.info('My PID is %d' % os.getpid())
 
         retcode = 1
+        lost_connection_backoff = 10
+        last_connection_failure = time.time()
 
         while True:
             try:
                 self.connect_target()
+                self.connect_replicas()
+
                 self.mysql_dst.query('SET SESSION innodb_lock_wait_timeout=5')
                 self.mysql_dst.query('USE %s' % self.bucket)
                 self.dst_dsn['db'] = self.bucket
@@ -1733,27 +1782,44 @@ class ReplicationClient(object):
                             retcode = 0
                     except Exception as err:
                         retcode = 0
+                elif err.errno in [errorcode.CR_SERVER_LOST_EXTENDED, errorcode.CR_CONN_HOST_ERROR]:
+                    self.logger.warning(str(err))
+                    if lost_connection_backoff >= 80:
+                        self.logger.error('Too many connection failures, giving up')
+                        retcode = 2
+                        break
+
+                    if (time.time()-last_connection_failure) > 100:
+                        lost_connection_backoff = 10
+
+                    self.logger.info('Waiting %d seconds to reconnect' % lost_connection_backoff)
+                    time.sleep(lost_connection_backoff)
+                    lost_connection_backoff += lost_connection_backoff
+                    last_connection_failure = time.time()
                 else:
                     self.logger.error(str(err))
-                    tb = traceback.format_exc().splitlines()
-                    for l in tb:
-                        self.logger.error(l)
-                    return 1
+                    backtrace = traceback.format_exc().splitlines()
+                    for line in backtrace:
+                        self.logger.error(line)
+                    retcode = 1
+                    break
 
                 self.logger.info('Restarting replication')
             except Exception as err:
                 self.logger.error(str(err))
-                tb = traceback.format_exc().splitlines()
-                for l in tb:
-                    self.logger.error(l)
+                backtrace = traceback.format_exc().splitlines()
+                for line in backtrace:
+                    self.logger.error(line)
                 return 1
 
             if retcode == 0:
                 break
 
-        self.logger.info('Replication client stopped on %s:%d' % (self.checkpoint_committed_binlog_fil,
-                                                                  int(self.checkpoint_committed_binlog_pos)))
-        return 0
+        if self.checkpoint_committed_binlog_fil is not None:
+            self.logger.info('Replication client stopped on %s:%d' % (
+                self.checkpoint_committed_binlog_fil, int(self.checkpoint_committed_binlog_pos)))
+
+        return retcode
 
 
 class MySQLConnection(object):
