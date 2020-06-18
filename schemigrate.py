@@ -320,6 +320,7 @@ class Schemigrate(object):
         self.replication_client = None
         self.is_alive = True
         self.checkpoint_only = True if self.opts.mode == 'serialized' else False
+        self.state = 0
 
     def signal_handler(self, signal, frame):
         self.logger.info("Signal caught (%s), cleaning up" % str(signal))
@@ -342,10 +343,14 @@ class Schemigrate(object):
     def connect_source(self):
         if self.mysql_src is None or not self.mysql_src.conn.is_connected():
             self.mysql_src = MySQLConnection(self.opts.src_dsn, 'Schemigrator, src')
+            if self.state > 0:
+                self.mysql_src.query('USE %s' % self.opts.src_dsn['db'])
 
     def connect_target(self):
         if self.mysql_dst is None or not self.mysql_dst.conn.is_connected():
             self.mysql_dst = MySQLConnection(self.opts.dst_dsn, 'Schemigrator, dst')
+            if self.state > 0:
+                self.mysql_dst.query('USE %s' % self.opts.src_dsn['db'])
 
     def setup_bootstrap(self):
         self.connect_source()
@@ -358,6 +363,7 @@ class Schemigrate(object):
 
         self.mysql_dst.query('CREATE DATABASE IF NOT EXISTS %s' % self.opts.src_dsn['db'])
         self.mysql_dst.query('USE %s' % self.opts.src_dsn['db'])
+        self.state = 1
 
     def setup_metadata_tables(self, tables):
         self.mysql_dst.query(sql_schemigrator_binlog_status)
@@ -367,6 +373,7 @@ class Schemigrate(object):
         for table in tables:
             sql = "INSERT IGNORE INTO schemigrator_checkpoint (tbl) VALUES('%s')" % table
             self.mysql_dst.query(sql)
+        self.state = 2
 
     def create_dst_tables(self, tables):
         """ Copy tables from source to dest, do not create if table already exists
@@ -933,7 +940,6 @@ class TableCopier(object):
 
         rows_count = self.mysql_src.rowcount
 
-        vals = ', '.join(['%s'] * self.colcount)
         sql = ('LOAD DATA LOCAL INFILE "%s" IGNORE INTO TABLE %s CHARACTER SET %s '
                'FIELDS TERMINATED BY "\t\t" (%s)') % (self.inout_file_tsv, self.table, 
                                                       self.mysql_src.charset, self.columns_str)
@@ -1020,6 +1026,7 @@ class TableCopier(object):
         max_replica_lag_host = None
         max_replica_lag_time = time.time()
 
+        self.logger.info('Starting copy at next PK value %d' % self.lastpk)
         self.log_event_metrics(start=True, rows=0, frompk=self.lastpk, topk=0)
         while self.lastpk < self.maxpk and self.is_alive:
             self.logger.debug('__chunk_loop')
@@ -1058,10 +1065,10 @@ class TableCopier(object):
                 max_replica_lag_secs, max_replica_lag_host = self.max_replica_lag(max_lag=self.max_lag)
 
                 if max_replica_lag_secs is None:
-                    self.logger.error('None of the replicas has Seconds_Behind_Master')
+                    self.logger.warning('None of the replicas has Seconds_Behind_Master, paused')
                     time.sleep(5)
                 elif max_replica_lag_secs > self.max_lag:
-                    self.logger.error('Replica lag is %d on %s, paused' % (max_replica_lag_secs, max_replica_lag_host))
+                    self.logger.warning('Replica lag is %d on %s, paused' % (max_replica_lag_secs, max_replica_lag_host))
                     time.sleep(5)
                 else:
                     max_replica_lag_time = time.time()
@@ -1090,7 +1097,9 @@ class TableCopier(object):
                 try:
                     return self.start_copier()
                 except mysql.connector.Error as err:
-                    if err.errno in [errorcode.CR_SERVER_LOST_EXTENDED, errorcode.CR_CONN_HOST_ERROR]:
+                    self.logger.warning('Stopping copy at next PK value %d' % self.lastpk)
+                    if err.errno in [errorcode.CR_SERVER_LOST_EXTENDED, errorcode.CR_CONN_HOST_ERROR,
+                                     errorcode.CR_SERVER_LOST]:
                         self.logger.warning(str(err))
                         if lost_connection_backoff >= 80:
                             self.logger.error('Too many connection failures, giving up')
@@ -1209,12 +1218,15 @@ class ReplicationClient(object):
             statuses = self.list_tables_status()
             if self.checksum:
                 checksum = self.list_checksum_status()
+                overall = self.list_overall_status()
                 checksum_state = ', %d bad chksums' % checksum if checksum > 0 else ', no chksum errors'
+                overall_state = ', migration in progress' if overall > 0 else ', migration COMPLETE'
             else:
                 checksum_state = ''
-            self.logger.info("Tables: %d not started, %d in progress, %d complete, %d error%s" %(
+                overall_state = ''
+            self.logger.info("Tables: %d not started, %d in progress, %d complete, %d error%s%s" %(
                 statuses['not_started'], statuses['in_progress'], statuses['complete'], statuses['error'],
-                checksum_state
+                checksum_state, overall_state
             ))
             self.metrics['timer_copy'] = now
 
@@ -1336,6 +1348,14 @@ class ReplicationClient(object):
             return 0
 
         return checksums
+
+    def list_overall_status(self):
+        self.connect_target()
+        checksums = self.mysql_dst.query_array(sql_copy_checksum_progress)
+        if checksums is None:
+            return 0
+
+        return len(checksums)
 
     def get_table_primary_key(self, table):
         mysql_src = MySQLConnection(self.src_dsn, 'ReplicationClient, %s, src' % table)
@@ -1610,6 +1630,9 @@ class ReplicationClient(object):
         # a new GTID event if in case we want to resume replication manually
         xid_event = False
 
+        # Explicit rollback in case we are resuming from previous error
+        self.rollback_apply_trx()
+
         for binlogevent in stream:
             self.binlog_pos = int(stream.log_pos)
             self.binlog_fil = stream.log_file
@@ -1687,10 +1710,10 @@ class ReplicationClient(object):
                 max_replica_lag_secs, max_replica_lag_host = self.max_replica_lag(max_lag=self.max_lag)
 
                 if max_replica_lag_secs is None:
-                    self.logger.error('None of the replicas has Seconds_Behind_Master')
+                    self.logger.warning('None of the replicas has Seconds_Behind_Master, paused')
                     time.sleep(5)
                 elif max_replica_lag_secs > self.max_lag:
-                    self.logger.error('Replica lag is %d on %s, paused' % (max_replica_lag_secs, max_replica_lag_host))
+                    self.logger.warning('Replica lag is %d on %s, paused' % (max_replica_lag_secs, max_replica_lag_host))
                     time.sleep(5)
                 else:
                     max_replica_lag_time = time.time()
@@ -1773,8 +1796,12 @@ class ReplicationClient(object):
                 retcode = self.start_slave(self.checkpoint_committed_binlog_fil, 
                                            self.checkpoint_committed_binlog_pos)
             except mysql.connector.Error as err:
+                if self.checkpoint_committed_binlog_fil is not None:
+                    self.logger.warning('Replication client stopped on %s:%d' % (
+                        self.checkpoint_committed_binlog_fil, int(self.checkpoint_committed_binlog_pos)))
+
                 if err.errno in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
-                    self.logger.warn(str(err))
+                    self.logger.warning(str(err))
                     self.rollback_apply_trx()
                     # Returns False if no self.is_alive
                     try:
@@ -1782,7 +1809,8 @@ class ReplicationClient(object):
                             retcode = 0
                     except Exception as err:
                         retcode = 0
-                elif err.errno in [errorcode.CR_SERVER_LOST_EXTENDED, errorcode.CR_CONN_HOST_ERROR]:
+                elif err.errno in [errorcode.CR_SERVER_LOST_EXTENDED, errorcode.CR_CONN_HOST_ERROR,
+                                   errorcode.CR_SERVER_LOST]:
                     self.logger.warning(str(err))
                     if lost_connection_backoff >= 80:
                         self.logger.error('Too many connection failures, giving up')
@@ -1810,7 +1838,8 @@ class ReplicationClient(object):
                 backtrace = traceback.format_exc().splitlines()
                 for line in backtrace:
                     self.logger.error(line)
-                return 1
+                retcode = 1
+                break
 
             if retcode == 0:
                 break
