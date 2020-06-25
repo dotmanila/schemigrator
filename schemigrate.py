@@ -268,7 +268,11 @@ def sm_parse_dsn(dsn):
             params[dsn_keys[kv[0]]] = kv[1]
 
     # Enforce short connection timeout
-    params['connect_timeout'] = 2
+    # This is buggy on the driver, can lead to the below error
+    # mysql.connector.errors.OperationalError: 2055: Lost connection to MySQL server at 'host:3306',
+    # system error: The read operation timed out
+    # https://bugs.mysql.com/bug.php?id=74933
+    # params['connect_timeout'] = 2
 
     return params 
 
@@ -739,7 +743,7 @@ class TableCopier(object):
             self.logger.error('Source server does not support secure_file_priv')
             return False
         elif inout_file_tsv == '':
-            inout_file_tsv = '/tmp/schemigrator-chunk-%s.tsv' % self.table
+            inout_file_tsv = '/tmp/schemigrator-chunk-%s.%s.tsv' % (self.bucket, self.table)
             self.logger.info('Using %s as chunk TSV INFILE/OUTFILE' % inout_file_tsv)
         else:
             try:
@@ -753,7 +757,7 @@ class TableCopier(object):
                 return False
 
             inout_file_tsv = os.path.join(inout_file_tsv, 
-                                          'schemigrator-chunk-%s.tsv' % self.table)
+                                          'schemigrator-chunk-%s.%s.tsv' % (self.bucket, self.table))
             self.logger.info('Using %s as chunk TSV INFILE/OUTFILE' % inout_file_tsv)
 
         return inout_file_tsv
@@ -1434,6 +1438,7 @@ class ReplicationClient(object):
         # for a very long time even if the number of row events is less than chunk-size
         self.trx_open_ts = time.time()
         self.trx_open = True
+        self.logger.debug('>>>>>>>>>>>>>>>>>>>>>>>> BEGIN')
         return True
 
     def commit_apply_trx(self):
@@ -1449,10 +1454,12 @@ class ReplicationClient(object):
         self.metrics['commit_time'] += commit_time
         self.trx_size = 0
         self.trx_open = False
+        self.logger.debug('>>>>>>>>>>>>>>>>>>>>>>>> COMMIT')
 
     def rollback_apply_trx(self):
         if self.mysql_dst.conn.in_transaction:
             self.mysql_dst.conn.rollback()
+            self.logger.debug('>>>>>>>>>>>>>>>>>>>>>>>> ROLLBACK')
         self.trx_size = 0
         self.trx_open = False
 
@@ -1673,6 +1680,7 @@ class ReplicationClient(object):
             if not self.trx_open and binlogevent.table != 'schemigrator_checksums':
                 self.checkpoint_begin()
 
+            logger.debug(binlogevent.table)
             cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
             for row in binlogevent.rows:
                 try:
@@ -1726,6 +1734,14 @@ class ReplicationClient(object):
         return 0
 
     def start_slave(self, binlog_fil=None, binlog_pos=None):
+        self.connect_target()
+        self.connect_replicas()
+
+        self.mysql_dst.query('SET SESSION innodb_lock_wait_timeout=5')
+        self.mysql_dst.query('SET SESSION net_read_timeout=120')
+        self.mysql_dst.query('USE %s' % self.bucket)
+        self.dst_dsn['db'] = self.bucket
+
         this_binlog_fil = self.binlog_fil
         this_binlog_pos = self.binlog_pos
         if binlog_fil is not None:
@@ -1752,7 +1768,7 @@ class ReplicationClient(object):
         self.logger.info('Starting replication at %s:%d' % (this_binlog_fil, this_binlog_pos))
         stream = BinLogStreamReader(
             connection_settings=self.src_dsn, resume_stream=True,
-            server_id=172313514, log_file=this_binlog_fil, log_pos=this_binlog_pos,
+            server_id=int(time.time()), log_file=this_binlog_fil, log_pos=this_binlog_pos,
             only_events=[DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent, XidEvent], 
             blocking=False, only_schemas=[self.bucket])
 
@@ -1787,12 +1803,6 @@ class ReplicationClient(object):
 
         while True:
             try:
-                self.connect_target()
-                self.connect_replicas()
-
-                self.mysql_dst.query('SET SESSION innodb_lock_wait_timeout=5')
-                self.mysql_dst.query('USE %s' % self.bucket)
-                self.dst_dsn['db'] = self.bucket
                 retcode = self.start_slave(self.checkpoint_committed_binlog_fil, 
                                            self.checkpoint_committed_binlog_pos)
             except mysql.connector.Error as err:
@@ -1812,6 +1822,9 @@ class ReplicationClient(object):
                 elif err.errno in [errorcode.CR_SERVER_LOST_EXTENDED, errorcode.CR_CONN_HOST_ERROR,
                                    errorcode.CR_SERVER_LOST]:
                     self.logger.warning(str(err))
+                    backtrace = traceback.format_exc().splitlines()
+                    for line in backtrace:
+                        self.logger.debug(line)
                     if lost_connection_backoff >= 80:
                         self.logger.error('Too many connection failures, giving up')
                         retcode = 2
