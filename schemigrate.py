@@ -325,6 +325,8 @@ class Schemigrate(object):
         self.is_alive = True
         self.checkpoint_only = True if self.opts.mode == 'serialized' else False
         self.state = 0
+        self.proc_manager = None
+        self.manager_dict = None
 
     def signal_handler(self, signal, frame):
         self.logger.info("Signal caught (%s), cleaning up" % str(signal))
@@ -479,9 +481,7 @@ class Schemigrate(object):
         return repl.run()
 
     def start_table_copy(self, table):
-        manager = Manager()
-        return_dict = manager.dict()
-        self.table_copier = Process(target=self.run_table_copier, args=(table, return_dict, ), name='table_copier')
+        self.table_copier = Process(target=self.run_table_copier, args=(table, self.manager_dict, ), name='table_copier')
         self.table_copier.start()
 
         while self.is_alive and self.table_copier.is_alive():
@@ -495,7 +495,7 @@ class Schemigrate(object):
             self.logger.debug("__main_loop_sleep")
             time.sleep(3)
 
-        return return_dict['returncode']
+        return self.manager_dict['returncode']
 
     def copy_tables(self, tables):
         for table in tables:
@@ -532,6 +532,9 @@ class Schemigrate(object):
                                           args=(binlog_fil, binlog_pos, self.checkpoint_only),
                                           name='replication_client')
         self.replication_client.start()
+
+        self.proc_manager = Manager()
+        self.manager_dict = self.proc_manager.dict()
 
         while True:
             incompletes = self.list_incomplete_tables()
@@ -1500,14 +1503,21 @@ class ReplicationClient(object):
         self.trx_size += 1
 
     def insert(self, cursor, table, values):
-        sql = 'REPLACE INTO `%s` (`%s`) VALUES (%s)' % (table, '`,`'.join(values['values'].keys()),
-                                                        ','.join(['%s'] * len(values['values'])))
+        keys = values['values'].keys()
+        set_values = {}
+        # We do this so that binlog_row_image = MINIMAL works
+        for key in keys:
+            if values['values'][key] is not None:
+                set_values[key] = values['values'][key]
+
+        sql = 'REPLACE INTO `%s` (`%s`) VALUES (%s)' % (table, '`,`'.join(set_values.keys()),
+                                                        ','.join(['%s'] * len(set_values)))
         # print(sql)
-        # print(tuple(values['values'].values()))
+        # print(tuple(set_values.values()))
         # print('---------------------------------------------------')
 
         try:
-            cursor.execute(self.mysql_dst.sqlize(sql), tuple(values['values'].values()))
+            cursor.execute(self.mysql_dst.sqlize(sql), tuple(set_values.values()))
         except mysql.connector.errors.ProgrammingError as err:
             self.logger.error(sql)
             self.logger.error(values)
@@ -1680,7 +1690,6 @@ class ReplicationClient(object):
             if not self.trx_open and binlogevent.table != 'schemigrator_checksums':
                 self.checkpoint_begin()
 
-            logger.debug(binlogevent.table)
             cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
             for row in binlogevent.rows:
                 try:
