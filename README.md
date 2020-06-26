@@ -135,7 +135,8 @@ To identify the correct character set to use, you need to sample your data and i
     mysql> SET NAMES latin1;
     Query OK, 0 rows affected (0.00 sec)
     
-    mysql> SELECT * FROM t_utf8 WHERE CONVERT(s USING BINARY) RLIKE CONCAT('[', UNHEX('80'), '-', UNHEX('FF'), ']') LIMIT 1;
+    mysql> SELECT * FROM t_utf8 WHERE CONVERT(s USING BINARY) 
+        RLIKE CONCAT('[', UNHEX('80'), '-', UNHEX('FF'), ']') LIMIT 1;
     +----+---------------+
     | id | s             |
     +----+---------------+
@@ -146,7 +147,8 @@ To identify the correct character set to use, you need to sample your data and i
     mysql> SET NAMES utf8;
     Query OK, 0 rows affected (0.00 sec)
     
-    mysql> SELECT * FROM t_utf8 WHERE CONVERT(s USING BINARY) RLIKE CONCAT('[', UNHEX('80'), '-', UNHEX('FF'), ']') LIMIT 1;
+    mysql> SELECT * FROM t_utf8 WHERE CONVERT(s USING BINARY) 
+        RLIKE CONCAT('[', UNHEX('80'), '-', UNHEX('FF'), ']') LIMIT 1;
     +----+-----------------+
     | id | s               |
     +----+-----------------+

@@ -125,7 +125,7 @@ def test_insert(mysql_dst_bootstrap, mysql_dst_teardown, mysql_dst_conn):
 
     values = {'values': {'autonum': 1, 'c': 'a', 'n': None}}
 
-    with pytest.raises(mysql.connector.errors.IntegrityError) as excinfo:
+    with pytest.raises(mysql.connector.errors.DatabaseError) as excinfo:
         assert replclient.insert(cursor, 'single_pk', values)
     mysql_dst_teardown()
 
