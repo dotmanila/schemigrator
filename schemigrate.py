@@ -18,6 +18,7 @@ from pymysqlreplication.row_event import (
     WriteRowsEvent
 )
 from pymysqlreplication.event import XidEvent
+from pymysqlreplication.constants.FIELD_TYPE import VARCHAR, STRING, VAR_STRING, JSON
 
 """
 sudo apt install libmysqlclient-dev python3 python3-pip
@@ -612,6 +613,9 @@ class TableCopier(object):
         self.columns_str = None
         self.columns_arr = None
         self.columns_dict = None
+        self.columns_outfile = None
+        self.columns_infile = None
+        self.columns_set = None
         self.colcount = 0
         self.status = 0
         self.minpk = None
@@ -795,6 +799,7 @@ class TableCopier(object):
         return True
 
     def get_table_columns(self):
+        types_str = ['char', 'varchar', 'text', 'enum', 'set', 'json']
         sql = ('SELECT column_name AS col, is_nullable, data_type '
                'FROM information_schema.columns '
                'WHERE table_schema = "{0}" AND table_name = "{1}" '
@@ -805,9 +810,30 @@ class TableCopier(object):
             raise Exception('Table %s has no columns defined' % self.table)
 
         colarr = []
+        columns_outfile = []
+        columns_infile = []
+        columns_set = []
         self.colcount = len(columns)
         for column in columns:
             colarr.append(column['col'])
+            if column['data_type'] in types_str:
+                columns_outfile.append('HEX(CONVERT(`{0}` USING binary))'.format(escape(column['col'])))
+                columns_infile.append('@{0}'.format(column['col']))
+                columns_set.append('`{0}`=UNHEX(@{1})'.format(escape(column['col']), column['col']))
+            else:
+                columns_infile.append('`{0}`'.format(escape(column['col'])))
+                columns_outfile.append('`{0}`'.format(escape(column['col'])))
+
+        self.columns_outfile = ','.join(columns_outfile)
+        if len(columns_infile) > 0:
+            self.columns_infile = ','.join(columns_infile)
+        else:
+            self.columns_infile = ''
+
+        if len(columns_set) > 0:
+            self.columns_set = 'SET %s' % ','.join(columns_set)
+        else:
+            self.columns_set = ''
 
         self.columns_str = list_to_col_str(colarr)
         self.columns_arr = colarr
@@ -877,9 +903,10 @@ class TableCopier(object):
                 return err.errno, commit_ts
             else:
                 self.logger.error(str(err))
-                tb = traceback.format_exc().splitlines()
-                for l in tb:
-                    self.logger.error(l)
+                self.logger.error(sql)
+                backtrace = traceback.format_exc().splitlines()
+                for line in backtrace:
+                    self.logger.debug(line)
                 return err.errno, commit_ts
 
         return 0, commit_ts
@@ -933,10 +960,18 @@ class TableCopier(object):
         if os.path.exists(self.inout_file_tsv):
             os.unlink(self.inout_file_tsv)
 
-        sql = ('SELECT /* SQL_NO_CACHE */ %s INTO OUTFILE "%s" CHARACTER SET %s '
-               'FIELDS TERMINATED BY "\t\t" FROM %s WHERE %s BETWEEN %d AND %d') % (
-                    self.columns_str, self.inout_file_tsv, self.mysql_src.charset,
-                    self.table, self.pk, frompk, topk)
+        # print(self.columns_outfile)
+        # print(self.columns_infile)
+        # print(self.columns_set)
+        # sql = ('SELECT /* SQL_NO_CACHE */ %s INTO OUTFILE "%s" CHARACTER SET %s '
+        #        'FIELDS TERMINATED BY "\t\t" FROM %s WHERE %s BETWEEN %d AND %d') % (
+        #             self.columns_str, self.inout_file_tsv, self.mysql_src.charset,
+        #             self.table, self.pk, frompk, topk)
+
+        sql = (('SELECT /* SQL_NO_CACHE */ %s INTO OUTFILE "%s" CHARACTER SET %s '
+                'FIELDS TERMINATED BY "\t\t" FROM %s WHERE %s BETWEEN %d AND %d') % (
+                    self.columns_outfile, self.inout_file_tsv, self.mysql_src.charset,
+                    self.table, self.pk, frompk, topk))
 
         rows = self.mysql_src.query_array(sql)
         rows_count = 0
@@ -947,9 +982,14 @@ class TableCopier(object):
 
         rows_count = self.mysql_src.rowcount
 
-        sql = ('LOAD DATA LOCAL INFILE "%s" IGNORE INTO TABLE %s CHARACTER SET %s '
-               'FIELDS TERMINATED BY "\t\t" (%s)') % (self.inout_file_tsv, self.table, 
-                                                      self.mysql_src.charset, self.columns_str)
+        # sql = ('LOAD DATA LOCAL INFILE "%s" IGNORE INTO TABLE %s CHARACTER SET %s '
+        #        'FIELDS TERMINATED BY "\t\t" (%s)') % (self.inout_file_tsv, self.table,
+        #                                               self.mysql_src.charset, self.columns_str)
+
+        sql = (('LOAD DATA LOCAL INFILE "%s" IGNORE INTO TABLE %s CHARACTER SET %s '
+                'FIELDS TERMINATED BY "\t\t" (%s) %s') % (self.inout_file_tsv, self.table,
+                                                          self.mysql_src.charset, self.columns_infile,
+                                                          self.columns_set))
 
         retries = 0
         while True:
@@ -961,7 +1001,7 @@ class TableCopier(object):
                 if code in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
                     self.logger.info('Chunk copy transaction failed, retrying from %d to %d' % (frompk, topk))
                     retries += 1
-                else: 
+                else:
                     return False, False
 
                 if retries >= 3:
@@ -1108,7 +1148,7 @@ class TableCopier(object):
                     if err.errno in [errorcode.CR_SERVER_LOST_EXTENDED, errorcode.CR_CONN_HOST_ERROR,
                                      errorcode.CR_SERVER_LOST]:
                         self.logger.warning(str(err))
-                        if lost_connection_backoff >= 80:
+                        if lost_connection_backoff >= 600:
                             self.logger.error('Too many connection failures, giving up')
                             return 2
 
@@ -1502,13 +1542,20 @@ class ReplicationClient(object):
 
         self.trx_size += 1
 
-    def insert(self, cursor, table, values):
+    def insert(self, cursor, table, values, columns):
         keys = values['values'].keys()
         set_values = {}
         # We do this so that binlog_row_image = MINIMAL works
         for key in keys:
             if values['values'][key] is not None:
                 set_values[key] = values['values'][key]
+
+                # Handles columns encoded differently that connection charset
+                # `Key` varchar(1024) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL
+                if columns[key].character_set_name != self.mysql_dst.charset and \
+                        columns[key].type in [VARCHAR, STRING, VAR_STRING, JSON] and \
+                        isinstance(values['values'][key], str):
+                    set_values[key] = values['values'][key].encode(columns[key].character_set_name)
 
         sql = 'REPLACE INTO `%s` (`%s`) VALUES (%s)' % (table, '`,`'.join(set_values.keys()),
                                                         ','.join(['%s'] * len(set_values)))
@@ -1610,14 +1657,15 @@ class ReplicationClient(object):
         # If backoff is triggered 3 times in succession, we provide space to table copier
         # and avoid lengthy deadlock conditions which can cause the process to get into
         # an infinite circular deadlock situation and not progressing.
-        if self.backoff_counter < 3:
+        if self.backoff_counter < 10:
             self.backoff_counter += 1
 
             if self.backoff_last_ts is None:
                 self.backoff_last_ts = time.time()
+                self.backoff_elapsed = 10
                 return True
 
-            if self.backoff_last_fil != self.checkpoint_committed_binlog_fil and \
+            if self.backoff_last_fil != self.checkpoint_committed_binlog_fil or \
                     self.backoff_last_pos != self.checkpoint_committed_binlog_pos:
                 self.logger.debug('Backoff reset')
                 self.backoff_reset()
@@ -1628,6 +1676,7 @@ class ReplicationClient(object):
             self.backoff_elapsed = (time.time()-self.backoff_last_ts)+(self.backoff_elapsed*1.2)
             self.logger.debug('Backoff increment, %f seconds, counter %d' % (
                 round(self.backoff_elapsed, 2), self.backoff_counter))
+            self.logger.info('Backoff triggered, sleeping %d seconds' % round(self.backoff_elapsed, 2))
             if not self.sleep_timer(self.backoff_elapsed):
                 return False
         else:
@@ -1691,6 +1740,10 @@ class ReplicationClient(object):
                 self.checkpoint_begin()
 
             cursor = mysql.connector.cursor.MySQLCursorDict(self.mysql_dst.conn)
+            columns = {}
+            for column in binlogevent.columns:
+                columns[column.name] = column
+
             for row in binlogevent.rows:
                 try:
                     if binlogevent.table == 'schemigrator_checksums':
@@ -1703,7 +1756,7 @@ class ReplicationClient(object):
                     elif isinstance(binlogevent, UpdateRowsEvent):
                         self.update(cursor, binlogevent.table, row)
                     elif isinstance(binlogevent, WriteRowsEvent):
-                        self.insert(cursor, binlogevent.table, row)
+                        self.insert(cursor, binlogevent.table, row, columns)
 
                     self.metrics['rows'] += 1
                     xid_event = False
@@ -1747,7 +1800,7 @@ class ReplicationClient(object):
         self.connect_replicas()
 
         self.mysql_dst.query('SET SESSION innodb_lock_wait_timeout=5')
-        self.mysql_dst.query('SET SESSION net_read_timeout=120')
+        self.mysql_dst.query('SET NAMES %s' % self.src_dsn['charset'])
         self.mysql_dst.query('USE %s' % self.bucket)
         self.dst_dsn['db'] = self.bucket
 
@@ -1775,6 +1828,7 @@ class ReplicationClient(object):
                 self.setup_for_checksum(table)
 
         self.logger.info('Starting replication at %s:%d' % (this_binlog_fil, this_binlog_pos))
+
         stream = BinLogStreamReader(
             connection_settings=self.src_dsn, resume_stream=True,
             server_id=int(time.time()), log_file=this_binlog_fil, log_pos=this_binlog_pos,
@@ -1834,7 +1888,7 @@ class ReplicationClient(object):
                     backtrace = traceback.format_exc().splitlines()
                     for line in backtrace:
                         self.logger.debug(line)
-                    if lost_connection_backoff >= 80:
+                    if lost_connection_backoff >= 600:
                         self.logger.error('Too many connection failures, giving up')
                         retcode = 2
                         break
