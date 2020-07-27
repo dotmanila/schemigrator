@@ -34,13 +34,9 @@ def test_list_bucket_tables():
     assert schemigrator.setup_metadata_tables(['single_pk']) is None
 
 
-def test_is_table_copy_complete():
-    assert schemigrator.is_table_copy_complete('non_existent_table') == 0
-    assert schemigrator.is_table_copy_complete('single_pk') == 0
-
-
 def test_list_incomplete_tables():
-    assert schemigrator.list_incomplete_tables() == [{'tbl': 'single_pk', 'status': 0}]
+    assert schemigrator.list_incomplete_tables() == ['single_pk']
+    assert schemigrator.list_incomplete_tables(status=[schemigrate.TABLE_COMPLETE]) is None
 
 
 def test_setup_metadata_tables(mysql_dst_conn):

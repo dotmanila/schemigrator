@@ -33,6 +33,18 @@ mysql_params_global = {'host': '127.0.0.1',
                        'passwd': 'schemigrator'}
 
 
+class MockColumn(object):
+    def __init__(self, t, n, c, s, m='', u=True, b=False, p=False):
+        self.type = t
+        self.name = n
+        self.collation_name = c
+        self.character_set_name = s
+        self.comment = m
+        self.unsigned = u
+        self.type_is_bool = b
+        self.is_primary = p
+
+
 class MySQLControl(object):
     def __init__(self, params):
         self.conn = mysql.connector.connect(**params, auth_plugin='mysql_native_password', autocommit=True, use_pure=True)
@@ -62,6 +74,7 @@ class MySQLControl(object):
             return None
         return results[0]
 
+
 def mysql_conn(port, db=None):
     params = dict(mysql_params_global)
 
@@ -71,6 +84,7 @@ def mysql_conn(port, db=None):
     mysql_ctl_src = MySQLControl(params)
 
     return mysql_ctl_src
+
 
 def init():
     logger = logging.getLogger(__name__)
@@ -145,29 +159,36 @@ def init():
 
     return opts, logger, schemigrator
 
+
 @pytest.fixture
 def mysql_src_conn():
     return mysql_conn(13300, db=None)
+
 
 @pytest.fixture
 def mysql_dst_conn():
     return mysql_conn(13301, db=None)
 
+
 @pytest.fixture
 def mysql_repl1_conn():
     return mysql_conn(13302, db=None)
+
 
 @pytest.fixture
 def mysql_repl2_conn():
     return mysql_conn(13303, db=None)
 
+
 @pytest.fixture
 def mysql_dst_conn_bucket():
     return mysql_conn(13301, db='single_pk')
 
+
 @pytest.fixture
 def mysql_src_conn_bucket():
     return mysql_conn(13300, db='single_pk')
+
 
 @pytest.fixture
 def mysql_dst_bootstrap(mysql_dst_conn):
@@ -179,8 +200,10 @@ def mysql_dst_bootstrap(mysql_dst_conn):
         mysql_dst_conn.query(schemigrate.sql_schemigrator_checksums)
         mysql_dst_conn.query(schemigrate.sql_schemigrator_checkpoint)
         mysql_dst_conn.query(schemigrate.sql_schemigrator_binlog_status)
+        mysql_dst_conn.query(schemigrate.sql_schemigrator_heartbeat)
 
     return run
+
 
 @pytest.fixture
 def mysql_dst_teardown(mysql_dst_conn):
@@ -189,13 +212,21 @@ def mysql_dst_teardown(mysql_dst_conn):
 
     return run
 
+
+@pytest.fixture
+def single_pk_columns():
+    return {
+        'autonum': MockColumn(9, 'autonum', 'latin1_general_ci', 'latin1', u=True, p=True),
+        'c': MockColumn(1, 'c', 'latin1_general_ci', 'latin1'),
+        'n': MockColumn(9, 'n', 'latin1_general_ci', 'latin1', u=True),
+    }
+
+
 if __name__ == "__main__":
     opts, logger, schemigrator = init()
-    print(schemigrator.opts.src_dsn)
-    print(opts.dst_dsn)
     replclient = schemigrate.ReplicationClient(opts.src_dsn, opts.dst_dsn, opts.bucket, binlog_fil=None,
-                                           binlog_pos=None, debug=True, pause_file=None, stop_file=None, 
-                                           chunk_size=1000, replica_dsns=opts.replicas, max_lag=60, 
-                                           checksum=True)
+                                               binlog_pos=None, debug=True, pause_file=None, stop_file=None,
+                                               chunk_size=1000, replica_dsns=opts.replicas, max_lag=60,
+                                               checksum=True)
     replclient.get_table_columns('xxxccc')
 
