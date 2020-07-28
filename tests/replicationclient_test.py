@@ -161,23 +161,29 @@ def test_begin_apply_trx():
 def test_compose_columns_and_values(monkeypatch, single_pk_columns):
     values = {'autonum': 1, 'c': 'a', 'n': 1}
     column_keys, set_keys, set_values = replclient.compose_columns_and_values(values, single_pk_columns)
+    column_keys.sort()
+    set_keys.sort()
     assert column_keys == ['`autonum`', '`c`', '`n`']
     assert set_keys == ['%s', '%s', '%s']
-    assert set_values == [1, 'a', 1]
+    assert len(set_values) == 3
     values = {'autonum': 1, 'c': 'a', 'n': None}
     column_keys, set_keys, set_values = replclient.compose_columns_and_values(values, single_pk_columns,
                                                                               null_check=True)
+    column_keys.sort()
+    set_keys.sort()
     assert column_keys == ['`autonum`', '`c`']
     assert set_keys == ['%s', '%s']
-    assert set_values == [1, 'a']
+    assert len(set_values) == 2
     values = {'autonum': 1, 'c': 'ó', 'n': 1}
     monkeypatch.setattr(replclient.mysql_applier, 'charset', 'utf8')
     column_keys, set_keys, set_values = replclient.compose_columns_and_values(values, single_pk_columns,
                                                                               charset_check=True)
+    column_keys.sort()
+    set_keys.sort()
     assert replclient.mysql_applier.charset == 'utf8'
     assert column_keys == ['`autonum`', '`c`', '`n`']
-    assert set_keys == ['%s', 'UNHEX(%s)', '%s']
-    assert set_values == [1, 'f3', 1]
+    assert set_keys == ['%s', '%s', 'UNHEX(%s)']
+    assert 'f3' in set_values
 
 
 def test_insert(mysql_dst_bootstrap, mysql_dst_teardown, mysql_dst_conn, single_pk_columns):
