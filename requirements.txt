@@ -1,5 +1,6 @@
 dnspython==1.16.0
 mysql-replication==0.21
+pymysql==0.9.3
 mysql-connector-python==8.0.21
 pytest==5.3.5
 pytest-cov==2.8.1

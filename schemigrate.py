@@ -474,25 +474,47 @@ class SchemigrateBase(object):
         return True
 
     def _mysql_keepalive_src(self):
-        if self.mysql_src_conn is None or (self.mysql_src_conn is not None and
-                                           ((time.time()-self.mysql_src_heartbeat_ts) > 5
-                                            or not self.mysql_src_conn.conn.is_connected)):
-            self.mysql_src_conn = MySQLConnection(self.src_dsn, header='%s, src' % self.name)
-            if self.db is not None:
-                self.mysql_src_conn.query('USE %s' % self.db)
-            self.mysql_src_heartbeat_ts = time.time()
+        while True:
+            if self.mysql_src_conn is None or not self.mysql_src_conn.conn.is_connected():
+                break
+
+            if (time.time()-self.mysql_src_heartbeat_ts) > 5 and not self.mysql_src_conn.conn.is_connected():
+                break
+
+            if not self.mysql_src_conn.conn.is_connected():
+                self.mysql_src_conn.close()
+                break
+
+            return True
+
+        self.mysql_src_conn = MySQLConnection(self.src_dsn, header='%s, dst' % self.name)
+        if self.db is not None:
+            self.mysql_src_conn.query('USE %s' % self.db)
+        self.mysql_src_heartbeat_ts = time.time()
+        return True
 
     def _mysql_keepalive_dst(self):
-        if self.mysql_dst_conn is None or (self.mysql_dst_conn is not None and
-                                           ((time.time()-self.mysql_dst_heartbeat_ts) > 5
-                                            or not self.mysql_dst_conn.conn.is_connected)):
-            self.mysql_dst_conn = MySQLConnection(self.dst_dsn, header='%s, dst' % self.name)
-            if self.db is not None:
-                try:
-                    self.mysql_dst_conn.query('USE %s' % self.db)
-                except mysql.connector.errors.ProgrammingError as err:
-                    pass
-            self.mysql_dst_heartbeat_ts = time.time()
+        while True:
+            if self.mysql_dst_conn is None or not self.mysql_dst_conn.conn.is_connected():
+                break
+
+            if (time.time()-self.mysql_dst_heartbeat_ts) > 5 and not self.mysql_dst_conn.conn.is_connected():
+                break
+
+            if not self.mysql_dst_conn.conn.is_connected():
+                self.mysql_dst_conn.close()
+                break
+
+            return True
+
+        self.mysql_dst_conn = MySQLConnection(self.dst_dsn, header='%s, dst' % self.name)
+        if self.db is not None:
+            try:
+                self.mysql_dst_conn.query('USE %s' % self.db)
+            except mysql.connector.errors.ProgrammingError as err:
+                pass
+        self.mysql_dst_heartbeat_ts = time.time()
+        return True
 
     def _mysql_keepalive(self):
         self._mysql_keepalive_src()
@@ -828,10 +850,11 @@ class Schemigrate(SchemigrateBase):
                 if self.heartbeat_client.is_alive():
                     break
 
-                if self.heartbeat_client.exitcode == 24:
+                exitcode = self.heartbeat_client.exitcode
+                if exitcode == 24:
                     self.logger.info("Restarting heartbeat client from previous error")
-                else:
-                    return self.heartbeat_client.exitcode
+                elif exitcode > 0:
+                    return exitcode
 
             if self.heartbeat_client is None or not self.heartbeat_client.is_alive():
                 self.heartbeat_client = Process(target=self.run_heartbeat_client, args=(),
@@ -842,22 +865,31 @@ class Schemigrate(SchemigrateBase):
         return 0
 
     def ensure_replication_running(self, checkpoint_only=False):
+        started_here = False
         while True:
             if self.replication_client is not None:
                 if self.replication_client.is_alive():
                     break
 
-                if self.replication_client.exitcode == 24:
+                exitcode = self.replication_client.exitcode
+                if exitcode == 24:
                     self.logger.info("Restarting replication client from previous error")
-                else:
-                    return self.replication_client.exitcode
+                elif exitcode > 0:
+                    return exitcode
 
             if self.replication_client is None or not self.replication_client.is_alive():
+                if started_here and checkpoint_only and exitcode == 0:
+                    # Short circuits checkpoint only as long as there was at least
+                    # one attempt to start and optionally if already terminated
+                    # exitcode is 0
+                    break
+
                 binlog_fil, binlog_pos = self.get_binlog_coords()
                 self.replication_client = Process(target=self.run_replication_client,
                                                   args=(binlog_fil, binlog_pos, checkpoint_only),
                                                   name='replication_client')
                 self.replication_client.start()
+                started_here = True
                 time.sleep(2)
 
         return 0
@@ -1294,13 +1326,13 @@ class TableCopier(SchemigrateBase):
             self.status = 1
         except mysql.connector.Error as err:
             if err.errno in [errorcode.ER_LOCK_DEADLOCK, errorcode.ER_LOCK_WAIT_TIMEOUT]:
-                self.logger.warn(str(err))
+                self.logger.warning(str(err))
                 return err.errno, commit_ts
             else:
                 self.logger.error(str(err))
-                tb = traceback.format_exc().splitlines()
-                for l in tb:
-                    self.logger.error(l)
+                backtrace = traceback.format_exc().splitlines()
+                for line in backtrace:
+                    self.logger.error(line)
                 return 1, commit_ts
 
         return 0, commit_ts
@@ -1858,7 +1890,7 @@ class TableChecksumRunner(SchemigrateBase):
             if not self.is_alive:
                 break
 
-            next_pk += self.chunk_size
+            next_pk += (self.chunk_size - 1)
             chunks_counter += 1
 
             if (time.time()-loop_timer) > 5:
@@ -1910,13 +1942,7 @@ class HeartbeatClient(SchemigrateBase):
         super(HeartbeatClient, self).__init__(src_dsn, db=db)
         self.logger = sm_create_logger(debug, self.name)
 
-    def run(self):
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
-
-        self.logger.info('Starting')
-        self.logger.info('My PID is %d' % os.getpid())
-
+    def main_heartbeat_loop(self):
         self.mysql_src.query(sql_schemigrator_heartbeat)
         sql = "REPLACE INTO schemigrator_heartbeat (ts, server_id) VALUES(UTC_TIMESTAMP(), %s)"
 
@@ -1924,10 +1950,27 @@ class HeartbeatClient(SchemigrateBase):
             if not self.is_alive:
                 break
 
-            self.mysql_src.query(sql, (self.mysql_src.server_id, ))
+            try:
+                self.mysql_src.query(sql, (self.mysql_src.server_id, ))
+            except OSError as err:
+                self.logger.error(str(err))
+                if 'Too many open files' in str(err):
+                    return 24
+                else:
+                    return 1
+
             time.sleep(1)
 
         return 0
+
+    def run(self):
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+
+        self.logger.info('Starting')
+        self.logger.info('My PID is %d' % os.getpid())
+
+        sys.exit(self.main_heartbeat_loop())
 
 
 class ReplicationClient(SchemigrateBase):
