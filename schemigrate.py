@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import logging
 import mysql.connector
 import os
@@ -12,7 +13,6 @@ import warnings
 from math import ceil
 from multiprocessing import Process
 from mysql.connector import errorcode
-from optparse import OptionParser
 from pprint import pprint as pp
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.row_event import (
@@ -139,72 +139,68 @@ def sm_sigterm_handler(signal, frame):
 
 
 def sm_buildopts():
-    opt_usage = "Usage: %prog [options] COMMAND"
     opt_desc = "Migrate databases from one MySQL server to another."
-    opt_epilog = ""
-    parser = SchemigrateOptionParser(opt_usage, version="%prog " + str(VERSION),
-                                     description=opt_desc, epilog=opt_epilog)
-    parser.add_option('-B', '--bucket', dest='bucket', type='string',
-                      help='The bucket/database name to migrate', default=None)
-    parser.add_option('-n', '--chunk-size', dest='chunk_size', type='int',
-                      help='How many rows per transaction commit', default=1000)
-    parser.add_option('', '--chunk-size-repl', dest='chunk_size_repl', type='int',
-                      help=('How many rows per transaction commit for ReplicationClient, '
-                            'overrides --chunk-size'), default=0)
-    parser.add_option('', '--chunk-size-copy', dest='chunk_size_copy', type='int',
-                      help='How many rows per transaction commit for TableCopier, '
-                           'overrides --chunk-size', default=0)
-    parser.add_option('-r', '--max-lag', dest='max_lag', type='int',
-                      help='Max replication lag (seconds) on target to start throttling', default=60)
-    parser.add_option('-m', '--max-lag-copy', dest='max_lag_copy', type='int', default=0,
-                      help='Max replication lag (seconds) on target to start throttling table copy')
-    parser.add_option('-M', '--max-lag-repl', dest='max_lag_repl', type='int', default=0,
-                      help='Max replication lag (seconds) on target to start throttling replication')
-    parser.add_option('-R', '--replica-dsns', dest='replica_dsns', type='string', action='append',
-                      help='Replica DSNs to check for replication lag', default=[])
-    parser.add_option('-d', '--debug', dest='debug', action="store_true",
-                      help='Enable debugging outputs', default=False)
-    parser.add_option('-c', '--defaults-file', dest='dotmycnf', type='string',
-                      help='Path to .my.cnf containing connection credentials to MySQL',
-                      default='~/.my.cnf')
-    parser.add_option('-L', '--log', dest='log', type='string',
-                      help='Log output to specified file',
-                      default=None)
-    parser.add_option('-x', '--stop-file', dest='stop_file', type='string',
-                      help='When this file exists, the script terminates itself',
-                      default=None)
-    parser.add_option('-p', '--pause-file', dest='pause_file', type='string',
-                      help='When this script exists, the script pauses copying and replication',
-                      default=None)
-    parser.add_option('-X', '--dry-run', dest='dryrun', action="store_true",
-                      help='Show what the script will be doing instead of actually doing it',
-                      default=False)
-    parser.add_option('-o', '--use-insert-select', dest='use_insert_select', action="store_true",
-                      help=(('Instead of using SELECT INTO OUTFILE/LOAD DATA INFILE, use native '
-                             'and slower simulated INSERT INTO SELECT')),
-                      default=False)
-    parser.add_option('-C', '--checksum', dest='checksum', action="store_true",
-                      help=(('Checksum chunks as they are copied, '
-                             'ReplicationClient validates the checksums')),
-                      default=False)
-    parser.add_option('-O', '--checksum-reset', dest='checksum_reset', action="store_true",
-                      help=(('Checksum only, useful when you want to re-validate ',
-                             'after all tables has been copied, re-initializes state for checksum')),
-                      default=False)
-    parser.add_option('-w', '--mode', dest='mode', type="choice", choices=["parallel", "serialized"],
-                      help='Show what the script will be doing instead of actually doing it',
-                      default="parallel")
-    parser.add_option('-i', '--report-interval', dest='report_interval', type="int",
-                      help='How often to print status outputs',
-                      default="10")
+    parser = argparse.ArgumentParser(description=opt_desc)
+    parser.add_argument('source_dsn_raw', help='Source DSN', metavar='source_dsn')
+    parser.add_argument('target_dsn_raw', help='Target DSN', metavar='target_dsn')
+    parser.add_argument('-v', '--version', action='version', version='%(prog)s ' + str(VERSION))
+    parser.add_argument('-B', '--bucket', dest='bucket', type=str,
+                        help='The bucket/database name to migrate', default=None)
+    parser.add_argument('-n', '--chunk-size', dest='chunk_size', type=int,
+                        help='How many rows per transaction commit', default=1000)
+    parser.add_argument('--chunk-size-repl', dest='chunk_size_repl', type=int,
+                        help='How many rows per transaction commit for ReplicationClient, overrides --chunk-size',
+                        default=0)
+    parser.add_argument('--chunk-size-copy', dest='chunk_size_copy', type=int,
+                        help='How many rows per transaction commit for TableCopier, overrides --chunk-size',
+                        default=0)
+    parser.add_argument('-r', '--max-lag', dest='max_lag', type=int,
+                        help='Max replication lag (seconds) on target to start throttling', default=60)
+    parser.add_argument('-m', '--max-lag-copy', dest='max_lag_copy', type=int, default=0,
+                        help='Max replication lag (seconds) on target to start throttling table copy')
+    parser.add_argument('-M', '--max-lag-repl', dest='max_lag_repl', type=int, default=0,
+                        help='Max replication lag (seconds) on target to start throttling replication')
+    parser.add_argument('-R', '--replica-dsns', dest='replica_dsns', type=str, action='append',
+                        help='Replica DSNs to check for replication lag', default=[])
+    parser.add_argument('-d', '--debug', dest='debug', action="store_true",
+                        help='Enable debugging outputs', default=False)
+    parser.add_argument('-c', '--defaults-file', dest='dotmycnf', type=str,
+                        help='Path to .my.cnf containing connection credentials to MySQL',
+                        default='~/.my.cnf')
+    parser.add_argument('-L', '--log', dest='log', type=str,
+                        help='Log output to specified file',
+                        default=None)
+    parser.add_argument('-x', '--stop-file', dest='stop_file', type=str,
+                        help='When this file exists, the script terminates itself',
+                        default=None)
+    parser.add_argument('-p', '--pause-file', dest='pause_file', type=str,
+                        help='When this script exists, the script pauses copying and replication',
+                        default=None)
+    parser.add_argument('-X', '--dry-run', dest='dryrun', action="store_true",
+                        help='Show what the script will be doing instead of actually doing it',
+                        default=False)
+    parser.add_argument('-o', '--use-insert-select', dest='use_insert_select', action="store_true",
+                        help=('Instead of using SELECT INTO OUTFILE/LOAD DATA INFILE, use native and '
+                              'slower simulated INSERT INTO SELECT'),
+                        default=False)
+    parser.add_argument('-C', '--checksum', dest='checksum', action="store_true",
+                        help='Checksum chunks as they are copied, ReplicationClient validates the checksums',
+                        default=False)
+    parser.add_argument('-O', '--checksum-reset', dest='checksum_reset', action="store_true",
+                        help=('Checksum only, useful when you want to re-validate after all tables has been '
+                              'copied, re-initializes state for checksum'),
+                        default=False)
+    parser.add_argument('-w', '--mode', dest='mode', choices=["parallel", "serialized"],
+                        help='Show what the script will be doing instead of actually doing it',
+                        default="parallel")
+    parser.add_argument('-i', '--report-interval', dest='report_interval', type=int,
+                        help='How often to print status outputs',
+                        default="10")
 
-    (opts, args) = parser.parse_args()
+    opts = parser.parse_args()
 
-    if len(args) != 2:
-        parser.error('Source and destination DSNs are required')
-
-    opts.src_dsn = sm_parse_dsn(args[0])
-    opts.dst_dsn = sm_parse_dsn(args[1])
+    opts.src_dsn = sm_parse_dsn(opts.source_dsn_raw)
+    opts.dst_dsn = sm_parse_dsn(opts.target_dsn_raw)
     if 'port' not in opts.src_dsn:
         opts.src_dsn['port'] = 3306
     else:
@@ -1591,6 +1587,9 @@ class TableCopier(SchemigrateBase):
                     if err.errno in [errorcode.CR_SERVER_LOST_EXTENDED, errorcode.CR_CONN_HOST_ERROR,
                                      errorcode.CR_SERVER_LOST]:
                         self.logger.warning(str(err))
+                        # Too many open files error wrapped in MySQL error
+                        if 'system error: 24' in str(err):
+                            sys.exit(24)
                         if lost_connection_backoff >= 600:
                             self.logger.error('Too many connection failures, giving up')
                             sys.exit(2)
@@ -2745,6 +2744,10 @@ class ReplicationClient(SchemigrateBase):
                 elif err.errno in [errorcode.CR_SERVER_LOST_EXTENDED, errorcode.CR_CONN_HOST_ERROR,
                                    errorcode.CR_SERVER_LOST]:
                     self.logger.warning(str(err))
+                    # Too many open files error wrapped in MySQL error
+                    if 'system error: 24' in str(err):
+                        retcode = 24
+                        break
                     backtrace = traceback.format_exc().splitlines()
                     for line in backtrace:
                         self.logger.debug(line)
@@ -2883,13 +2886,6 @@ class MySQLConnection(object):
 
     def seconds_behind_master(self):
         return self.fetchone('SHOW SLAVE STATUS', 'Seconds_Behind_Master')
-
-
-# http://stackoverflow.com/questions/1857346/\
-# python-optparse-how-to-include-additional-info-in-usage-output
-class SchemigrateOptionParser(OptionParser):
-    def format_epilog(self, formatter):
-        return self.epilog
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import logging
 import mysql.connector
 import pytest
@@ -90,7 +91,7 @@ def init():
     logger = logging.getLogger(__name__)
     logger.addHandler(logging.NullHandler())
 
-    opts = schemigrate.SchemigrateOptionParser('test')
+    opts = argparse.ArgumentParser(description='test')
     opts.dst_dsn = dict(mysql_params_global)
     opts.dst_dsn['port'] = 13301
 

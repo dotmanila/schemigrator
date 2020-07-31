@@ -4,10 +4,6 @@
 
 ## Requirements
 
-    dnspython==1.16.0
-    mysql-replication==0.21
-    mysql-connector-python==8.0.19
-
 By default, the script uses `SELECT INTO OUTFILE` and `LOAD DATA LOCAL INFILE`, which means:
 
 - The script must be ran from the source MySQL server and `--secure-file-priv` enabled.
@@ -16,6 +12,29 @@ By default, the script uses `SELECT INTO OUTFILE` and `LOAD DATA LOCAL INFILE`, 
 Use the `--use-insert-select` option if you want to be able to run the script from anywhere. This is much slower though as it relies on `mysql.connector.cursor()`'s `executemany()` function and significantly slower even when we are batching commits.
 
 Checksumming is not enabled by default, enable with `--checksum` option explicitly. Checksumming requires that the account used on the source server is able to create a table on the source bucket called `schemigrator_checksums`. Checksum calculations from the source is inserted into this table which in turn the `ReplicationClient` uses this information to compare the checksum on the target. This is a similar and familiar approach with `pt-table-checksum` tool.
+
+## Installation
+
+On some environments, installing additional Python3 packages may not be possible. It is recommended to use `virtualenv` with `pypy3` to improve performance of the replication client.
+
+    cd $HOME
+    sudo apt install virtualenv
+    wget https://bitbucket.org/pypy/pypy/downloads/pypy3.6-v7.3.1-linux64.tar.bz2
+    tar xf pypy3.6-v7.3.1-linux64.tar.bz2
+    git clone https://github.com/dotmanila/schemigrator.git
+    cd schemigrator
+    virtualenv -p $HOME/pypy3.6-v7.3.1-linux64/bin/pypy3 pypy3
+    
+
+The next steps below activates the virtual environment, once activated make sure to install the module requirements after which you can run the script like above.
+
+    source pypy3/bin/activate
+    pip3 install -r requirements.txt
+
+When done running, exit from the `virtualenv`/sandbox using the following command.
+
+    deactivate
+
 
 ## Limitations
 
@@ -28,36 +47,53 @@ Checksumming is not enabled by default, enable with `--checksum` option explicit
     
 ## Command Line Options
 
-    Usage: schemigrate.py [options] COMMAND
-
+    usage: schemigrate.py [-h] [-v] [-B BUCKET] [-n CHUNK_SIZE]
+                          [--chunk-size-repl CHUNK_SIZE_REPL]
+                          [--chunk-size-copy CHUNK_SIZE_COPY] [-r MAX_LAG]
+                          [-m MAX_LAG_COPY] [-M MAX_LAG_REPL] [-R REPLICA_DSNS]
+                          [-d] [-c DOTMYCNF] [-L LOG] [-x STOP_FILE]
+                          [-p PAUSE_FILE] [-X] [-o] [-C] [-O]
+                          [-w {parallel,serialized}] [-i REPORT_INTERVAL]
+                          source_dsn target_dsn
+    
     Migrate databases from one MySQL server to another.
-
-    Options:
-      --version             show program's version number and exit
+    
+    positional arguments:
+      source_dsn            Source DSN
+      target_dsn            Target DSN
+    
+    optional arguments:
       -h, --help            show this help message and exit
-      -B BUCKET, --bucket=BUCKET
+      -v, --version         show program's version number and exit
+      -B BUCKET, --bucket BUCKET
                             The bucket/database name to migrate
-      -n CHUNK_SIZE, --chunk-size=CHUNK_SIZE
+      -n CHUNK_SIZE, --chunk-size CHUNK_SIZE
                             How many rows per transaction commit
-      --chunk-size-repl=CHUNK_SIZE_REPL
+      --chunk-size-repl CHUNK_SIZE_REPL
                             How many rows per transaction commit for
                             ReplicationClient, overrides --chunk-size
-      --chunk-size-copy=CHUNK_SIZE_COPY
+      --chunk-size-copy CHUNK_SIZE_COPY
                             How many rows per transaction commit for TableCopier,
                             overrides --chunk-size
-      -r MAX_LAG, --max-lag=MAX_LAG
+      -r MAX_LAG, --max-lag MAX_LAG
                             Max replication lag (seconds) on target to start
                             throttling
-      -R REPLICA_DSNS, --replica-dsns=REPLICA_DSNS
+      -m MAX_LAG_COPY, --max-lag-copy MAX_LAG_COPY
+                            Max replication lag (seconds) on target to start
+                            throttling table copy
+      -M MAX_LAG_REPL, --max-lag-repl MAX_LAG_REPL
+                            Max replication lag (seconds) on target to start
+                            throttling replication
+      -R REPLICA_DSNS, --replica-dsns REPLICA_DSNS
                             Replica DSNs to check for replication lag
       -d, --debug           Enable debugging outputs
-      -c DOTMYCNF, --defaults-file=DOTMYCNF
+      -c DOTMYCNF, --defaults-file DOTMYCNF
                             Path to .my.cnf containing connection credentials to
                             MySQL
-      -L LOG, --log=LOG     Log output to specified file
-      -x STOP_FILE, --stop-file=STOP_FILE
+      -L LOG, --log LOG     Log output to specified file
+      -x STOP_FILE, --stop-file STOP_FILE
                             When this file exists, the script terminates itself
-      -p PAUSE_FILE, --pause-file=PAUSE_FILE
+      -p PAUSE_FILE, --pause-file PAUSE_FILE
                             When this script exists, the script pauses copying and
                             replication
       -X, --dry-run         Show what the script will be doing instead of actually
@@ -67,16 +103,26 @@ Checksumming is not enabled by default, enable with `--checksum` option explicit
                             use native and slower simulated INSERT INTO SELECT
       -C, --checksum        Checksum chunks as they are copied, ReplicationClient
                             validates the checksums
+      -O, --checksum-reset  Checksum only, useful when you want to re-validate
+                            after all tables has been copied, re-initializes state
+                            for checksum
+      -w {parallel,serialized}, --mode {parallel,serialized}
+                            Show what the script will be doing instead of actually
+                            doing it
+      -i REPORT_INTERVAL, --report-interval REPORT_INTERVAL
+                            How often to print status outputs
 
 
 ## Example
 
-    python3 schemigrate.py \
-        u=msandbox,p=msandbox,h=127.0.0.1,P=5728,D=test,A=utf8 \
-        h=127.0.0.1,P=10001,u=msandbox,p=msandbox \
+    pypy3 schemigrate.py \
+        u=xxxxxxxx,p=xxxxxxxx,h=127.0.0.1,P=3306,D=dbname,A=latin1 \
+        h=172.16.21.21,P=3306,u=xxxxxxxx,p=xxxxxxxx \
         --stop-file=/tmp/schemigrator.stop --pause-file=/tmp/schemigrator.pause \
-        --replica-dsns h=127.0.0.1,P=10002 --replica-dsns h=127.0.0.1,P=10003 \
-        --chunk-size-repl=100 --chunk-size-copy=20000 --checksum
+        --replica-dsns h=172.16.22.22,P=3306 \
+        --max-lag-repl=1800 --max-lag-copy=60 \
+        --chunk-size-repl=1000 --chunk-size-copy=20000 \
+        --checksum --report-interval=10
 
 With the command above:
 
@@ -95,6 +141,35 @@ When `--checksum` is enabled, the following query can be used to see if there we
      OR master_crc <> this_crc
      OR ISNULL(master_crc) <> ISNULL(this_crc))
     GROUP BY db, tbl;
+
+## Interpreting Status Output
+
+    2020-07-31 00:58:49,474 <24405> INFO <Replication> Tables: 0 not started, 0 in progress, 
+        0 checksum, 5 complete, 0 error, no checksum errors, copy complete
+
+While the script is running, you will get status outputs like above, this is interpreted as:
+
+- `0 not started`: No tables pending to be copied.
+- `0 in progress`: No tables currently being copied.
+- `0 checksum`: No tables currently being checksummed.
+- `5 complete`: 5 tables has completed copy from source to target.
+- `0 error`: No tables has failed copy.
+- `no checksum errors`: No checksum errors were detected.
+- `copy complete`: All tables have been copied to target.
+
+Additionally, outputs like below will be emitted.
+
+    2020-07-31 01:03:09,577 <24405> INFO <Replication> Status: mysql-bin.007623:599130064, 
+        32093 events/r (12.8MiB), 0 rows/w, 0.4921 lat (ms), lag (P) 6.0 secs
+
+These can be interpreted as:
+
+- `32093 events/r`: The number of events read from binary logs since last report interval i.e. 10 seconds.
+- `0 rows/w`: The number of rows applied to the current database being migrated.
+- `0.4921 lat (ms)`: Total amount of time to apply the previous metric.
+- `lag (P) 6.0 secs`: Heartbeat delay from source to target.
+- `lag (S) 8.0 secs`: Max value of `Seconds_Behind_Master` when `--replica-dsns` is specified.
+
 
 ### Some Notes on DSN (Data Source Names)
 
@@ -160,7 +235,7 @@ In the above example, we should use `A=utf8`.
 
 ## Use Native MySQL Replication
 
-As soon as all tables have been copied and checksumming is completed, it is recommended, when possible to use MySQL's native replication instead of relying on the script's simulated replication. The former would be faster in this case.
+If needed, you can use MySQL's native replication instead of relying on the script's simulated replication but this is NOT RECOMMENDED. Using the script's replication client combined with `pypy3` is much faster. The former would be faster in this case.
 
 To verify if checksumming is complete, you can use the query below on the target database. If the query result is empty it means that all tables has been copied and checksum has been completed. Of course, also check that there are not bad checksum results above.
 
@@ -179,7 +254,7 @@ As soon as checksumming and table copy is complete, you can stop the script and 
 
 We can use these coordinates to configure replication on the target, however do not start replication immediately.
 
-    CHANGE MASTER TO MASTER_HOST='<source_server_host>', MASTER_USER='usernsame', 
+    CHANGE MASTER TO MASTER_HOST='<source_server_host>', MASTER_USER='username', 
     MASTER_PASSWORD=’xxxxxxxxxx’, MASTER_LOG_FILE='mysql-bin.000349', 
     MASTER_LOG_POS=540463919;
 
@@ -196,25 +271,6 @@ Once replication is running, `pt-table-checksum` can also be manually ran agains
     pt-table-checksum --recursion-method=none --replicate=test.checksums --databases=test \
         h=127.0.0.1,P=5728,u=msandbox,p=msandbox
 
-
-## Running with virtualenv
-
-On some environments, installing additional Python3 packages may not be possible. For these hosts, we can use `virtualenv` as long as Python3 is available on the host. `python3-pip` might also not be installed by default and can be installed separately.
-
-    sudo apt install python3-pip
-    git clone https://github.com/dotmanila/schemigrator.git
-    pip3 install virtualenv
-    virtualenv -p $(which python3) schemigrator
-    cd schemigrator
-
-The next steps below activates the virtual environment, once activated make sure to install the module requirements after which you can run the script like above.
-
-    source bin/activate
-    pip3 install -r requirements.txt
-
-When done running, exit from the `virtualenv`/sandbox using the following command.
-
-    deactivate
 
 ## Running Tests
 
